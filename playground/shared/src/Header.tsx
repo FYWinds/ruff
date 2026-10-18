@@ -1,4 +1,5 @@
 import classNames from "classnames";
+import type { ReactNode } from "react";
 import RepoButton from "./RepoButton";
 import ShareButton from "./ShareButton";
 import ThemeButton from "./ThemeButton";
@@ -17,6 +18,7 @@ export default function Header({
   onCopyMarkdownLink,
   onCopyMarkdown,
   onDownload,
+  examples,
 }: {
   theme: Theme;
   tool: "ruff" | "ty";
@@ -28,6 +30,8 @@ export default function Header({
   onCopyMarkdownLink: () => Promise<void>;
   onCopyMarkdown: () => Promise<void>;
   onDownload(): void;
+  /** Optional examples picker, rendered before the Reset button. */
+  examples?: ReactNode;
 }) {
   return (
     <div
@@ -55,6 +59,9 @@ export default function Header({
         <Divider />
         <RepoButton href={`https://github.com/astral-sh/${tool}`} />
         <Divider />
+        {examples != null ? (
+          <div className="max-sm:hidden flex">{examples}</div>
+        ) : null}
         <div className="max-sm:hidden flex">
           <ResetButton onClicked={onReset} />
         </div>

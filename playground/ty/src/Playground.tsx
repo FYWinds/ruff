@@ -29,10 +29,12 @@ import tySchema from "../../../ty.schema.json";
 import Chrome, { formatError } from "./Editor/Chrome";
 import { isPythonFile } from "./Editor/Files";
 import { runPython } from "./Editor/runPython";
+import type { ActiveExample } from "./Editor/SecondaryPanel";
+import { EXAMPLES, type Example, findExample } from "./examples";
+import ExamplesMenu from "./ExamplesMenu";
+import { DEFAULT_SETTINGS, SETTINGS_FILE_NAME } from "./settings";
 import type { Monaco } from "@monaco-editor/react";
 import type { editor, Uri } from "monaco-editor";
-
-export const SETTINGS_FILE_NAME = "ty.json";
 
 export default function Playground() {
   const [theme, setTheme] = useTheme();
@@ -40,6 +42,7 @@ export default function Playground() {
   const [error, setError] = useState<string | null>(null);
   const [files, dispatchFiles] = useReducer(filesReducer, INIT_FILES_STATE);
   const [session, setSession] = useState<PlaygroundSession | null>(null);
+  const [example, setExample] = useState<Example | null>(null);
 
   const sessionPromiseRef = useRef<Promise<PlaygroundSession> | null>(null);
   if (sessionPromiseRef.current == null) {
@@ -53,6 +56,7 @@ export default function Playground() {
         () => dispatchFiles({ type: "documentChanged" }),
       );
       restoreWorkspace(session, fetched.workspace, dispatchFiles);
+      setExample(fetched.example);
       setSession(session);
       return session;
     });
@@ -69,7 +73,31 @@ export default function Playground() {
       : files.metadata[files.selected].name;
   }, [files.metadata, files.selected]);
 
-  usePersistLocally(files, session);
+  const activeExample = useMemo((): ActiveExample | null => {
+    if (example == null) {
+      return null;
+    }
+    const serialized = serializeFiles(files, session);
+    const expected = example.workspace.files;
+    const modified =
+      serialized != null &&
+      (Object.keys(serialized.files).length !== Object.keys(expected).length ||
+        Object.entries(serialized.files).some(
+          ([name, content]) => expected[name] !== content,
+        ));
+    return { example, modified };
+  }, [example, files, session]);
+
+  // Once an example is edited, drop `?example=` from the URL so that a reload
+  // restores the edits from local storage instead of the pristine example.
+  const modified = activeExample?.modified ?? false;
+  useEffect(() => {
+    if (modified) {
+      setExampleUrl(null);
+    }
+  }, [modified]);
+
+  usePersistLocally(files, session, example);
 
   const handleShare = useCallback(async () => {
     const serialized = serializeFiles(files, session);
@@ -218,31 +246,64 @@ export default function Playground() {
     dispatchFiles({ type: "clearVendoredFile" });
   }, []);
 
+  const replaceWorkspace = useCallback(
+    (session: PlaygroundSession, next: Example) => {
+      const workspace = session.workspace;
+
+      // Close all open files
+      for (const file of Object.values(files.metadata)) {
+        if (file.handle != null) {
+          try {
+            workspace.closeFile(file.handle);
+          } catch (e) {
+            setError(formatError(e));
+          }
+        }
+      }
+
+      session.closeDocuments(
+        Object.values(files.metadata).map((file) => file.name),
+      );
+      dispatchFiles({ type: "reset" });
+
+      restoreWorkspace(session, next.workspace, dispatchFiles);
+      setExample(next);
+      setExampleUrl(next.slug);
+    },
+    [files],
+  );
+
   const handleReset = useCallback(() => {
     if (session == null) {
       return;
     }
 
-    const workspace = session.workspace;
+    replaceWorkspace(session, DEFAULT_EXAMPLE);
+  }, [session, replaceWorkspace]);
 
-    // Close all open files
-    for (const file of Object.values(files.metadata)) {
-      if (file.handle != null) {
-        try {
-          workspace.closeFile(file.handle);
-        } catch (e) {
-          setError(formatError(e));
-        }
+  const handleSelectExample = useCallback(
+    (slug: string) => {
+      const next = findExample(slug);
+      if (session == null || next == null) {
+        return;
       }
-    }
 
-    session.closeDocuments(
-      Object.values(files.metadata).map((file) => file.name),
-    );
-    dispatchFiles({ type: "reset" });
+      // A workspace that isn't a pristine example (edited, shared, or restored
+      // from local storage) would be lost.
+      const unsaved = activeExample == null || activeExample.modified;
+      if (
+        unsaved &&
+        !window.confirm(
+          `Discard the current workspace and load the example "${next.title}"?`,
+        )
+      ) {
+        return;
+      }
 
-    restoreWorkspace(session, DEFAULT_WORKSPACE, dispatchFiles);
-  }, [session, files]);
+      replaceWorkspace(session, next);
+    },
+    [session, activeExample, replaceWorkspace],
+  );
 
   return (
     <main className="flex flex-col h-full bg-white dark:bg-ayu-background-dark">
@@ -257,6 +318,13 @@ export default function Playground() {
         onCopyMarkdown={handleCopyMarkdown}
         onDownload={handleDownload}
         onReset={session == null ? undefined : handleReset}
+        examples={
+          <ExamplesMenu
+            examples={EXAMPLES}
+            selected={example?.slug ?? null}
+            onSelect={handleSelectExample}
+          />
+        }
       />
 
       <Suspense fallback={<Loading />}>
@@ -270,6 +338,7 @@ export default function Playground() {
           onRemoveFile={handleFileRemoved}
           onSelectFile={handleFileSelected}
           onRun={handleRun}
+          activeExample={activeExample}
           onSelectVendoredFile={handleVendoredFileSelected}
           onClearVendoredFile={handleVendoredFileCleared}
         />
@@ -302,53 +371,29 @@ function isConfigurationFile(name: string): boolean {
   return name === "ty.toml" || name === "pyproject.toml";
 }
 
-export const DEFAULT_SETTINGS = JSON.stringify(
-  {
-    environment: {
-      "python-version": "3.14",
-    },
-    analysis: {
-      "strict-equality-semantics": false,
-      "strict-generic-narrowing": false,
-    },
-    rules: {
-      "experimental-syntax": "ignore",
-      "undefined-reveal": "ignore",
-    },
-  },
-  null,
-  4,
-);
+/**
+ * The playground opens with the conditional types example (or the first
+ * example if it doesn't exist), which also is what Reset restores.
+ */
+const DEFAULT_EXAMPLE = findExample("conditional-basic") ?? EXAMPLES[0];
 
-const DEFAULT_PROGRAM = `from typing import Literal
-
-type Style = Literal["italic", "bold", "underline"]
-
-# Add parameter annotations \`line: str, word: str, style: Style\` and a return
-# type annotation \`-> str\` to see if you can find the mistakes in this program.
-
-def with_style(line, word, style):
-    if style == "italic":
-        return line.replace(word, f"*{word}*")
-    elif style == "bold":
-        return line.replace(word, f"__{word}__")
-
-    position = line.find(word)
-    output = line + "\\n"
-    output += " " * position
-    output += "-" * len(word)
-
-
-print(with_style("ty is a fast type checker for Python.", "fast", "underlined"))
-`;
-
-const DEFAULT_WORKSPACE = {
-  files: {
-    "main.py": DEFAULT_PROGRAM,
-    "ty.json": DEFAULT_SETTINGS,
-  },
-  current: "main.py",
-};
+/**
+ * Sets or (for `null`) removes the `?example=` query parameter. Selecting an
+ * example also leaves any share URL, as the workspace no longer matches it.
+ */
+function setExampleUrl(slug: string | null) {
+  const url = new URL(window.location.href);
+  if (slug == null) {
+    if (!url.searchParams.has("example")) {
+      return;
+    }
+    url.searchParams.delete("example");
+  } else {
+    url.pathname = "/";
+    url.searchParams.set("example", slug);
+  }
+  window.history.replaceState(null, "", url);
+}
 
 /**
  * Persists the files to local storage. This is done deferred to avoid too frequent writes.
@@ -356,15 +401,17 @@ const DEFAULT_WORKSPACE = {
 function usePersistLocally(
   files: FilesState,
   session: PlaygroundSession | null,
+  example: Example | null,
 ): void {
   const deferredFiles = useDeferredValue(files);
+  const slug = example?.slug ?? null;
 
   useEffect(() => {
     const serialized = serializeFiles(deferredFiles, session);
     if (serialized != null) {
-      persistLocal(serialized);
+      persistLocal(serialized, slug);
     }
-  }, [deferredFiles, session]);
+  }, [deferredFiles, session, slug]);
 }
 
 export type FileId = number;
@@ -611,6 +658,7 @@ export interface InitializedPlayground {
   version: string;
   monaco: Monaco;
   workspace: { files: { [name: string]: string }; current: string };
+  example: Example | null;
 }
 
 // Run once during startup. Initializes monaco, loads the wasm file, and restores the previous editor state.
@@ -633,14 +681,15 @@ async function startPlayground(): Promise<InitializedPlayground> {
     schema: tySchema,
   });
 
-  const restored = await restore();
-
-  const workspace = restored ?? DEFAULT_WORKSPACE;
+  const restored = (await restore()) ?? {
+    workspace: DEFAULT_EXAMPLE.workspace,
+    example: DEFAULT_EXAMPLE,
+  };
 
   return {
     version,
     monaco,
-    workspace,
+    ...restored,
   };
 }
 

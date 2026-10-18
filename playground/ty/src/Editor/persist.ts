@@ -1,3 +1,4 @@
+import { type Example, findExample } from "../examples";
 import { fetchPlayground, savePlayground } from "./api";
 import {
   generatePlaygroundMarkdown,
@@ -9,6 +10,13 @@ interface Workspace {
 
   // Name of the current file
   current: string;
+}
+
+export interface RestoredWorkspace {
+  workspace: Workspace;
+
+  // The example the workspace was loaded from, if any.
+  example: Example | null;
 }
 
 /**
@@ -46,10 +54,15 @@ export async function copyAsMarkdown(workspace: Workspace): Promise<void> {
 }
 
 /**
- * Restore the workspace by fetching the data for the ID specified in the URL
- * or by restoring from local storage.
+ * Restore the workspace, in order of precedence, from:
+ *
+ * 1. the share ID in the URL path,
+ * 2. the `?example=<slug>` query parameter,
+ * 3. local storage.
+ *
+ * Returns `null` if there is nothing to restore.
  */
-export async function restore(): Promise<Workspace | null> {
+export async function restore(): Promise<RestoredWorkspace | null> {
   // URLs stored in the database, like:
   //     https://play.ruff.rs/1b9d6bcd-bbfd-4b2d-9b5d-ab8dfbbd4bed
   const id = window.location.pathname.slice(1);
@@ -59,14 +72,31 @@ export async function restore(): Promise<Workspace | null> {
       return null;
     }
 
-    return playground;
+    return { workspace: playground, example: null };
   }
 
-  // If no URL is present, restore from local storage.
+  const slug = new URLSearchParams(window.location.search).get("example");
+  if (slug != null) {
+    const example = findExample(slug);
+    if (example != null) {
+      return { workspace: example.workspace, example };
+    }
+
+    // oxlint-disable-next-line no-console
+    console.warn(
+      `Unknown example '${slug}', restoring the workspace from local storage instead.`,
+    );
+  }
+
+  // Otherwise, restore from local storage.
   return restoreLocal();
 }
 
-export function persistLocal(workspace: Workspace) {
+/**
+ * Persists the workspace to local storage, together with the slug of the
+ * example it was loaded from (if any).
+ */
+export function persistLocal(workspace: Workspace, example: string | null) {
   let totalLength = 0;
   for (const fileContent of Object.values(workspace.files)) {
     totalLength += fileContent.length;
@@ -79,15 +109,21 @@ export function persistLocal(workspace: Workspace) {
     }
   }
 
-  localStorage.setItem("workspace", JSON.stringify(workspace));
+  localStorage.setItem("workspace", JSON.stringify({ ...workspace, example }));
 }
 
-function restoreLocal(): Workspace | null {
-  const workspace = localStorage.getItem("workspace");
+function restoreLocal(): RestoredWorkspace | null {
+  const stored = localStorage.getItem("workspace");
 
-  if (workspace == null) {
+  if (stored == null) {
     return null;
-  } else {
-    return JSON.parse(workspace);
   }
+
+  const { example, ...workspace }: Workspace & { example?: string | null } =
+    JSON.parse(stored);
+
+  return {
+    workspace,
+    example: example == null ? null : (findExample(example) ?? null),
+  };
 }

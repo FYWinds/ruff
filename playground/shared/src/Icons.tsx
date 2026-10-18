@@ -173,6 +173,23 @@ export function Comments() {
   );
 }
 
+export function Info() {
+  return (
+    <svg
+      width="24"
+      height="24"
+      viewBox="0 0 24 24"
+      xmlns="http://www.w3.org/2000/svg"
+    >
+      <path
+        fillRule="evenodd"
+        clipRule="evenodd"
+        d="M12 1.5a10.5 10.5 0 1 0 0 21a10.5 10.5 0 1 0 0-21ZM12 3a9 9 0 1 1 0 18a9 9 0 1 1 0-18ZM11 6.5H13V8.5H11ZM11 10H13V17.5H11Z"
+      />
+    </svg>
+  );
+}
+
 export function Add() {
   return (
     <svg

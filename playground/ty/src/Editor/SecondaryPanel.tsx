@@ -1,6 +1,7 @@
 import MonacoEditor from "@monaco-editor/react";
 import { AstralButton, Theme } from "shared";
 import { ReadonlyFiles } from "../Playground";
+import type { Example } from "../examples";
 import { Suspense, use, useState } from "react";
 import classNames from "classnames";
 
@@ -8,10 +9,18 @@ export enum SecondaryTool {
   AST = "AST",
   Tokens = "Tokens",
   Run = "Run",
+  About = "About",
 }
 
 export type SecondaryPanelResult =
   null | { status: "ok"; content: string } | { status: "error"; error: string };
+
+/** The example the current workspace was loaded from. */
+export interface ActiveExample {
+  example: Example;
+  /** Whether the workspace differs from the example's files. */
+  modified: boolean;
+}
 
 export interface SecondaryPanelProps {
   files: ReadonlyFiles;
@@ -19,6 +28,7 @@ export interface SecondaryPanelProps {
   tool: SecondaryTool;
   result: SecondaryPanelResult;
   theme: Theme;
+  activeExample: ActiveExample | null;
 }
 
 export default function SecondaryPanel({
@@ -27,15 +37,61 @@ export default function SecondaryPanel({
   files,
   onRun,
   theme,
+  activeExample,
 }: SecondaryPanelProps) {
   return (
     <div className="flex flex-col h-full">
-      <Content
-        tool={tool}
-        result={result}
-        theme={theme}
-        onRun={onRun}
-        revision={files.revision}
+      {tool === SecondaryTool.About ? (
+        activeExample == null ? null : (
+          <About activeExample={activeExample} theme={theme} />
+        )
+      ) : (
+        <Content
+          tool={tool}
+          result={result}
+          theme={theme}
+          onRun={onRun}
+          revision={files.revision}
+        />
+      )}
+    </div>
+  );
+}
+
+function About({
+  activeExample: { example, modified },
+  theme,
+}: {
+  activeExample: ActiveExample;
+  theme: Theme;
+}) {
+  const sections = [
+    `# ${example.title}${modified ? " (modified)" : ""}`,
+    example.descriptionMarkdown,
+  ];
+  if (example.ts != null) {
+    sections.push(`TypeScript equivalent: \`${example.ts}\``);
+  }
+  sections.push(
+    `Deep link: \`?example=${example.slug}\` · ${example.phase === 0 ? "existing ty feature" : `PEP 827 phase ${example.phase}`}`,
+  );
+
+  return (
+    <div className="flex grow">
+      <MonacoEditor
+        options={{
+          readOnly: true,
+          minimap: { enabled: false },
+          fontSize: 14,
+          roundedSelection: false,
+          scrollBeyondLastLine: false,
+          contextmenu: false,
+          wordWrap: "on",
+          lineNumbers: "off",
+        }}
+        language="markdown"
+        value={sections.join("\n\n")}
+        theme={theme === "light" ? "Ayu-Light" : "Ayu-Dark"}
       />
     </div>
   );

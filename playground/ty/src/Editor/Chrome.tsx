@@ -23,6 +23,7 @@ import {
 import { Files, isPythonFile } from "./Files";
 import SecondarySideBar from "./SecondarySideBar";
 import SecondaryPanel, {
+  type ActiveExample,
   SecondaryPanelResult,
   SecondaryTool,
 } from "./SecondaryPanel";
@@ -47,6 +48,9 @@ export interface Props {
   selectedFileName: string;
   onRun(): Promise<string>;
 
+  /** The example the workspace was loaded from; enables the About panel. */
+  activeExample: ActiveExample | null;
+
   onAddFile(session: PlaygroundSession, name: string): void;
 
   onRenameFile(session: PlaygroundSession, file: FileId, newName: string): void;
@@ -66,6 +70,7 @@ export default function Chrome({
   sessionPromise,
   theme,
   onRun,
+  activeExample,
   onAddFile,
   onRenameFile,
   onRemoveFile,
@@ -76,9 +81,13 @@ export default function Chrome({
   const session = use(sessionPromise);
   const workspace = session.workspace;
 
-  const [secondaryTool, setSecondaryTool] = useState<SecondaryTool | null>(
-    null,
-  );
+  const [selectedSecondaryTool, setSecondaryTool] =
+    useState<SecondaryTool | null>(null);
+  // The About panel only exists while the workspace comes from an example.
+  const secondaryTool =
+    selectedSecondaryTool === SecondaryTool.About && activeExample == null
+      ? null
+      : selectedSecondaryTool;
 
   const editorRef = useRef<EditorHandle | null>(null);
 
@@ -251,6 +260,7 @@ export default function Chrome({
                     onRun={onRun}
                     theme={theme}
                     tool={secondaryTool}
+                    activeExample={activeExample}
                     result={checkResult.secondary}
                   />
                 </Panel>
@@ -258,6 +268,11 @@ export default function Chrome({
             )}
             <SecondarySideBar
               selected={secondaryTool}
+              aboutTitle={
+                activeExample == null
+                  ? null
+                  : `About${activeExample.modified ? " (modified)" : ""}`
+              }
               onSelected={handleSecondaryToolSelected}
             />
           </PanelGroup>

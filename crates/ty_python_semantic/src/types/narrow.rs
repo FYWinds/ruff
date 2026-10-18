@@ -755,6 +755,7 @@ impl<'db> ClassInfoConstraint<'_, 'db> {
             | Type::TypeIs(_)
             | Type::TypeGuard(_)
             | Type::TypeForm(_)
+            | Type::TypeOperator(_)
             | Type::WrapperDescriptor(_)
             | Type::DataclassTransformer(_)
             | Type::TypedDict(_)
@@ -5525,6 +5526,7 @@ fn is_or_contains_typeddict<'db>(db: &'db dyn Db, ty: Type<'db>) -> bool {
         | Type::TypeIs(_)
         | Type::TypeGuard(_)
         | Type::TypeForm(_)
+        | Type::TypeOperator(_)
         | Type::NewTypeInstance(_) => false,
     }
 }

@@ -411,6 +411,7 @@ impl<'db> Type<'db> {
                 | Type::TypeIs(_)
                 | Type::TypeGuard(_)
                 | Type::TypeForm(_)
+                | Type::TypeOperator(_)
                 | Type::TypedDict(_) => None,
 
                 // We could infer a precise tuple spec for enum classes with members,

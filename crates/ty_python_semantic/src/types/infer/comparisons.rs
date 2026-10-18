@@ -325,6 +325,9 @@ impl<'db> Type<'db> {
                 Type::TypeAlias(alias) => visit_type(db, ty, visitor, || {
                     upcast(db, env, alias.value_type(db), visitor)
                 }),
+                Type::TypeOperator(operator) => visit_type(db, ty, visitor, || {
+                    upcast(db, env, operator.upper_bound(db, env), visitor)
+                }),
                 Type::NewTypeInstance(newtype) => visit_type(db, ty, visitor, || {
                     UpcastResult::unstable(
                         upcast(db, env, newtype.concrete_base_type(db), visitor).ty,

@@ -180,6 +180,7 @@ mod suspicious_conditions;
 mod type_call;
 mod type_expression;
 mod type_form;
+mod type_operator;
 mod typed_dict;
 mod typeguard;
 mod typevar;
@@ -3104,6 +3105,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             Type::RecursiveVar(_) => {
                 unreachable!("semantic operation on an unbound recursive variable")
             }
+            Type::TypeOperator(operator) => self.validate_attribute_deletion(
+                target,
+                operator.upper_bound(db, env),
+                attribute,
+                emit_diagnostics,
+            ),
             Type::Union(union) => {
                 for element_ty in union.elements(db) {
                     if !self.validate_attribute_deletion(
@@ -5665,6 +5672,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 | Type::TypeIs(_)
                 | Type::TypeGuard(_)
                 | Type::TypeForm(_)
+                | Type::TypeOperator(_)
                 | Type::TypedDict(_)
                 | Type::NewTypeInstance(_) => None,
             }
@@ -11569,6 +11577,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             (_, Type::TypeAlias(alias)) => {
                 self.infer_unary_expression_type(op, alias.value_type(db), unary)
             }
+
+            (
+                ast::UnaryOp::Invert | ast::UnaryOp::UAdd | ast::UnaryOp::USub,
+                Type::TypeOperator(operator),
+            ) => self.infer_unary_expression_type(op, operator.upper_bound(db, env), unary),
 
             (ast::UnaryOp::UAdd, Type::LiteralValue(literal)) => match literal.kind() {
                 LiteralValueTypeKind::Int(value) => Type::int_literal(value.as_i64()),

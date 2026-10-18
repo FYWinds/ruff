@@ -30,6 +30,7 @@ use crate::types::recursive::RecursiveType;
 use crate::types::signatures::{Parameter, Parameters, ParametersKind, Signature};
 use crate::types::tuple::{TupleSpec, VariableSegment};
 use crate::types::type_alias::QualifiedTypeAliasName;
+use crate::types::type_operator::{TypeOperatorKind, TypeOperatorType};
 use crate::types::typevar::BoundTypeVarIdentity;
 use crate::types::visitor::TypeVisitor;
 use crate::types::{
@@ -1140,6 +1141,101 @@ fn fmt_type_guard_like<'db, T: TypeGuardLike<'db>>(
     f.write_str("]")
 }
 
+/// Python operator precedence of an unresolved type operator, as used when displaying it in
+/// source form. Higher binds tighter.
+fn type_operator_precedence<'db>(db: &'db dyn Db, ty: Type<'db>) -> u8 {
+    match ty {
+        Type::TypeOperator(operator) => match operator.kind(db) {
+            TypeOperatorKind::Conditional { .. } => 0,
+            TypeOperatorKind::Or(_) => 1,
+            TypeOperatorKind::And(_) => 2,
+            TypeOperatorKind::Not(_) => 3,
+            TypeOperatorKind::IsAssignable(..)
+            | TypeOperatorKind::IsEquivalent(..)
+            | TypeOperatorKind::Bool(_) => 4,
+        },
+        _ => 4,
+    }
+}
+
+/// Helper for displaying an unresolved type operator in its source form, e.g.
+/// `int if IsAssignable[T@f, str] else bytes`.
+fn fmt_type_operator<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    operator: TypeOperatorType<'db>,
+    settings: &DisplaySettings<'db>,
+    f: &mut TypeWriter<'_, '_, 'db>,
+) -> fmt::Result {
+    let operand = |f: &mut TypeWriter<'_, '_, 'db>, ty: Type<'db>, min_precedence: u8| {
+        let parenthesize = type_operator_precedence(db, ty) < min_precedence;
+        if parenthesize {
+            f.write_char('(')?;
+        }
+        ty.display_with(db, env, settings.singleline())
+            .fmt_detailed(f)?;
+        if parenthesize {
+            f.write_char(')')?;
+        }
+        Ok(())
+    };
+    let special_form = |f: &mut TypeWriter<'_, '_, 'db>,
+                        form: SpecialFormType,
+                        operands: &[Type<'db>]|
+     -> fmt::Result {
+        f.with_type(Type::SpecialForm(form))
+            .write_str(form.name())?;
+        f.write_char('[')?;
+        for (index, ty) in operands.iter().enumerate() {
+            if index > 0 {
+                f.write_str(", ")?;
+            }
+            operand(f, *ty, 0)?;
+        }
+        f.write_char(']')
+    };
+
+    match operator.kind(db) {
+        TypeOperatorKind::IsAssignable(source, target) => {
+            special_form(f, SpecialFormType::IsAssignable, &[*source, *target])
+        }
+        TypeOperatorKind::IsEquivalent(left, right) => {
+            special_form(f, SpecialFormType::IsEquivalent, &[*left, *right])
+        }
+        TypeOperatorKind::Bool(ty) => special_form(f, SpecialFormType::Bool, &[*ty]),
+        TypeOperatorKind::Not(ty) => {
+            f.write_str("not ")?;
+            operand(f, *ty, 3)
+        }
+        TypeOperatorKind::And(operands) | TypeOperatorKind::Or(operands) => {
+            let (separator, min_precedence) =
+                if matches!(operator.kind(db), TypeOperatorKind::And(_)) {
+                    (" and ", 3)
+                } else {
+                    (" or ", 2)
+                };
+            for (index, ty) in operands.iter().enumerate() {
+                if index > 0 {
+                    f.write_str(separator)?;
+                }
+                operand(f, *ty, min_precedence)?;
+            }
+            Ok(())
+        }
+        TypeOperatorKind::Conditional {
+            condition,
+            if_true,
+            if_false,
+        } => {
+            operand(f, *if_true, 1)?;
+            f.write_str(" if ")?;
+            operand(f, *condition, 1)?;
+            f.write_str(" else ")?;
+            operand(f, *if_false, 0)
+        }
+    }
+}
+
 /// Writes the string representation of a type, which is the value displayed either as
 /// `Literal[<repr>]` or `Literal[<repr1>, <repr2>]` for literal types or as `<repr>` for
 /// non literals
@@ -1762,6 +1858,9 @@ impl<'db> FmtDetailed<'db> for DisplayRepresentation<'_, 'db> {
                     .display_with(db, self.env, self.settings.clone())
                     .fmt_detailed(f)?;
                 f.write_char(']')
+            }
+            Type::TypeOperator(operator) => {
+                fmt_type_operator(db, self.env, operator, &self.settings, f)
             }
             Type::TypedDict(TypedDictType::Class(defining_class)) => match defining_class {
                 ClassType::NonGeneric(class) => class
@@ -3732,6 +3831,23 @@ impl<'db> FmtDetailed<'db> for DisplayMaybeParenthesizedType<'_, 'db> {
             }
             Type::Intersection(intersection) if !intersection.has_one_element(db) => {
                 write_parentheses(f)
+            }
+            // `if`/`and`/`or`/`not` bind more loosely than `|` and `&`, so an unresolved
+            // conditional or boolean combination must be parenthesized as an element.
+            Type::TypeOperator(operator)
+                if matches!(
+                    operator.kind(db),
+                    TypeOperatorKind::Conditional { .. }
+                        | TypeOperatorKind::And(_)
+                        | TypeOperatorKind::Or(_)
+                        | TypeOperatorKind::Not(_)
+                ) =>
+            {
+                f.write_char('(')?;
+                self.ty
+                    .display_with(db, self.env, self.settings.clone())
+                    .fmt_detailed(f)?;
+                f.write_char(')')
             }
             _ => self
                 .ty

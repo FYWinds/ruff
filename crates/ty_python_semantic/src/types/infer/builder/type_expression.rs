@@ -10,6 +10,7 @@ use ruff_python_ast::{self as ast, PythonVersion};
 use ruff_source_file::LineRanges;
 use ruff_text_size::{Ranged, TextRange};
 
+use super::type_operator::is_type_bool_operand_syntax;
 use super::{DeferredExpressionState, TypeInferenceBuilder};
 use crate::types::call::CallArguments;
 use crate::types::definition_resolution::{ImportAliasResolution, resolve_definition};
@@ -839,6 +840,12 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 Type::unknown()
             }
 
+            ast::Expr::BoolOp(bool_op)
+                if bool_op.values.iter().all(is_type_bool_operand_syntax) =>
+            {
+                self.infer_type_bool_op_type_expression(bool_op)
+            }
+
             ast::Expr::BoolOp(bool_op) => {
                 if !self.in_string_annotation() {
                     self.infer_boolean_expression(bool_op, TypeContext::default());
@@ -904,6 +911,14 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 operand_ty.negate(db, env)
             }
 
+            ast::Expr::UnaryOp(
+                unary @ ast::ExprUnaryOp {
+                    op: ast::UnaryOp::Not,
+                    operand,
+                    ..
+                },
+            ) if is_type_bool_operand_syntax(operand) => self.infer_type_not_type_expression(unary),
+
             ast::Expr::UnaryOp(unary) => {
                 if !self.in_string_annotation() {
                     self.infer_unary_expression(unary);
@@ -930,6 +945,10 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                     ),
                 );
                 Type::unknown()
+            }
+
+            ast::Expr::If(if_expression) if is_type_bool_operand_syntax(&if_expression.test) => {
+                self.infer_conditional_type_expression(if_expression)
             }
 
             ast::Expr::If(if_expression) => {
@@ -2448,6 +2467,11 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             }
 
             // `ty_extensions` special forms
+            SpecialFormType::IsAssignable
+            | SpecialFormType::IsEquivalent
+            | SpecialFormType::Bool => {
+                self.infer_type_bool_special_form_type_expression(subscript, special_form)
+            }
             SpecialFormType::Not => {
                 let arguments = if let ast::Expr::Tuple(tuple) = arguments_slice {
                     &*tuple.elts

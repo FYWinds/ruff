@@ -555,6 +555,32 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 )
             }),
 
+            (Type::TypeOperator(operator), rhs, _) => {
+                visitor.visit(db, (left_ty, op, right_ty), || {
+                    self.infer_binary_expression_type_impl(
+                        node,
+                        operator.upper_bound(db, env),
+                        rhs,
+                        op,
+                        visitor,
+                        state,
+                    )
+                })
+            }
+
+            (lhs, Type::TypeOperator(operator), _) => {
+                visitor.visit(db, (left_ty, op, right_ty), || {
+                    self.infer_binary_expression_type_impl(
+                        node,
+                        lhs,
+                        operator.upper_bound(db, env),
+                        op,
+                        visitor,
+                        state,
+                    )
+                })
+            }
+
             (Type::TypedDict(left_typed_dict), rhs, ast::Operator::BitOr)
                 if rhs.is_assignable_to(db, env, Type::TypedDict(left_typed_dict)) =>
             {

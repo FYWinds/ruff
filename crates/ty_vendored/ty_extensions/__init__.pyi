@@ -53,6 +53,46 @@ when displaying intersection types. Note that either spelling will fail in runti
 cases where an annotation expression could be evaluated.
 """
 
+IsAssignable: _SpecialForm
+"""
+`IsAssignable[T, S]` is an experimental [PEP 827] type boolean: it evaluates to `Literal[True]` if
+`T` is assignable to `S`, and to `Literal[False]` otherwise.
+
+The check is performed on `T` as a whole; unions are not distributed over. For example,
+`IsAssignable[int | str, int]` is `Literal[False]`. If either operand contains an unsolved type
+variable, evaluation is deferred until the type variable is specialized.
+
+Type booleans can be combined with `not`, `and` and `or`, and used as the condition of a
+conditional type:
+
+```python
+type Pick[T] = int if IsAssignable[T, str] else bytes
+```
+
+[PEP 827]: https://peps.python.org/pep-0827/
+"""
+
+IsEquivalent: _SpecialForm
+"""
+`IsEquivalent[T, S]` is an experimental [PEP 827] type boolean: it evaluates to `Literal[True]` if
+`T` is assignable to `S` and `S` is assignable to `T`, and to `Literal[False]` otherwise.
+
+Because this is defined in terms of assignability, gradual types are consistent with any type:
+`IsEquivalent[Any, int]` is `Literal[True]`.
+
+[PEP 827]: https://peps.python.org/pep-0827/
+"""
+
+Bool: _SpecialForm
+"""
+`Bool[T]` is an experimental [PEP 827] type boolean: it evaluates to `Literal[True]` if `T` is
+assignable to `Literal[True]` and is not assignable to `Never`, and to `Literal[False]` otherwise.
+
+This allows a type alias whose value is a type boolean to be used where a type boolean is expected.
+
+[PEP 827]: https://peps.python.org/pep-0827/
+"""
+
 Top: _SpecialForm
 """
 `Top[T]` represents the "top materialization" of `T`.

@@ -1922,6 +1922,9 @@ pub(crate) fn extract_unpacked_typed_dict_from_value_type<'db>(
         Type::RecursiveVar(_) => {
             unreachable!("semantic operation on an unbound recursive variable")
         }
+        Type::TypeOperator(operator) => {
+            extract_unpacked_typed_dict_from_value_type(db, env, operator.upper_bound(db, env))
+        }
         Type::TypedDict(td) => {
             let keys = td
                 .items(db)

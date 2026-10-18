@@ -322,6 +322,7 @@ impl<'db> Type<'db> {
             | Type::TypeForm(_)
             | Type::TypedDict(_)
             | Type::TypeAlias(_)
+            | Type::TypeOperator(_)
             | Type::NewTypeInstance(_) => false,
         }
     }
@@ -1928,6 +1929,27 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
             (_, Type::TypeAlias(target_alias)) => {
                 self.with_recursion_guard(db, source, target, || {
                     self.check_type_pair(db, source, target_alias.value_type(db))
+                })
+            }
+
+            // An unresolved type operator relates to itself; otherwise, as a source it is
+            // checked via its upper bound (`X | Y` for `X if C else Y`, `bool` for a type
+            // boolean), and as a target via its lower bound (`X & Y`, or `Never`).
+            (Type::TypeOperator(source_operator), Type::TypeOperator(target_operator))
+                if source_operator == target_operator =>
+            {
+                self.always()
+            }
+
+            (Type::TypeOperator(source_operator), _) => {
+                self.with_recursion_guard(db, source, target, || {
+                    self.check_type_pair(db, source_operator.upper_bound(db, env), target)
+                })
+            }
+
+            (_, Type::TypeOperator(target_operator)) => {
+                self.with_recursion_guard(db, source, target, || {
+                    self.check_type_pair(db, source, target_operator.lower_bound(db, env))
                 })
             }
 
@@ -3540,6 +3562,20 @@ impl<'a, 'c, 'db> DisjointnessChecker<'a, 'c, 'db> {
                 let right_alias_ty = alias.value_type(db);
                 self.with_recursion_guard(db, left, right, || {
                     self.check_type_pair(db, left, right_alias_ty)
+                })
+            }),
+
+            (Type::TypeOperator(operator), _) => nontrivial_check(self, || {
+                let left_upper = operator.upper_bound(db, env);
+                self.with_recursion_guard(db, left, right, || {
+                    self.check_type_pair(db, left_upper, right)
+                })
+            }),
+
+            (_, Type::TypeOperator(operator)) => nontrivial_check(self, || {
+                let right_upper = operator.upper_bound(db, env);
+                self.with_recursion_guard(db, left, right, || {
+                    self.check_type_pair(db, left, right_upper)
                 })
             }),
 

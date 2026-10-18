@@ -243,6 +243,7 @@ impl<'db> ClassBase<'db> {
             | Type::TypeIs(_)
             | Type::TypeGuard(_)
             | Type::TypeForm(_)
+            | Type::TypeOperator(_)
             | Type::TypedDict(_) => None,
 
             Type::KnownInstance(known_instance) => match known_instance {
@@ -303,6 +304,9 @@ impl<'db> ClassBase<'db> {
                 | SpecialFormType::Top
                 | SpecialFormType::Bottom
                 | SpecialFormType::Intersection
+                | SpecialFormType::IsAssignable
+                | SpecialFormType::IsEquivalent
+                | SpecialFormType::Bool
                 | SpecialFormType::TypeOf
                 | SpecialFormType::CallableTypeOf
                 | SpecialFormType::RegularCallableTypeOf

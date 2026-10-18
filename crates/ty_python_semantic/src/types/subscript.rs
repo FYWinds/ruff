@@ -605,6 +605,17 @@ impl<'db> Type<'db> {
                 Some(value_ty.subscript(db, env, alias.value_type(db), expr_context))
             }
 
+            (Type::TypeOperator(operator), _) => Some(operator.upper_bound(db, env).subscript(
+                db,
+                env,
+                slice_ty,
+                expr_context,
+            )),
+
+            (_, Type::TypeOperator(operator)) => {
+                Some(value_ty.subscript(db, env, operator.upper_bound(db, env), expr_context))
+            }
+
             // Expand overlapping alternatives before collecting their subscript errors.
             (Type::Union(union), _) if union.has_aliases(db) => Some(
                 union

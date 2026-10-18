@@ -212,6 +212,10 @@ impl<'db> Type<'db> {
                 .into_unfolded()?
                 .try_upcast_to_callable_with_policy_and_context(db, env, policy, context, receiver),
 
+            Type::TypeOperator(operator) => operator
+                .upper_bound(db, env)
+                .try_upcast_to_callable_with_policy_and_context(db, env, policy, context, receiver),
+
             Type::FunctionLiteral(function_literal)
                 if context.is_recursive_reference(db, function_literal) =>
             {

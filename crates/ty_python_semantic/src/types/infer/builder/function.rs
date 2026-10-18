@@ -2346,6 +2346,9 @@ fn is_instance_truthiness<'db>(
         Type::RecursiveVar(_) => {
             unreachable!("semantic operation on an unbound recursive variable")
         }
+        Type::TypeOperator(operator) => {
+            is_instance_truthiness(db, env, operator.upper_bound(db, env), class)
+        }
         Type::Union(..) => {
             // We do not handle unions specifically here, because something like `A | SubclassOfA` would
             // have been simplified to `A` anyway

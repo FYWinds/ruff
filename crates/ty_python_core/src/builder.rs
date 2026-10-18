@@ -233,6 +233,7 @@ impl ConditionFlowSnapshot {
     }
 }
 
+#[expect(clippy::struct_excessive_bools)]
 pub(super) struct SemanticIndexBuilder<'db, 'ast> {
     // Builder state
     db: &'db dyn Db,
@@ -263,6 +264,13 @@ pub(super) struct SemanticIndexBuilder<'db, 'ast> {
     has_future_annotations: bool,
     /// Whether we are currently visiting an `if TYPE_CHECKING` block.
     in_type_checking_block: bool,
+    /// Whether we are currently visiting a type expression (an annotation, a PEP 695 type alias
+    /// value, or a PEP 695 type parameter bound/default). Inside type expressions, `if`/`and`/
+    /// `or`/`not` are type-level operators (PEP 827), so they are walked plainly without
+    /// recording predicates, narrowing, or reachability constraints.
+    in_type_expression: bool,
+    /// `Annotated` metadata expressions (value expressions) nested inside a type expression.
+    value_expressions_in_type_expression: FxHashSet<ExpressionNodeKey>,
 
     // Used for checking semantic syntax errors
     resolver_environment: ResolverEnvironment<'db>,
@@ -337,6 +345,8 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
 
             has_future_annotations: false,
             in_type_checking_block: false,
+            in_type_expression: false,
+            value_expressions_in_type_expression: FxHashSet::default(),
 
             scopes: IndexVec::new(),
             place_tables: IndexVec::new(),
@@ -3031,12 +3041,15 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                 // or not a name is "bound" by a typevar declaration; the latter is always true.
                 self.mark_place_bound(symbol.into());
                 self.mark_place_declared(symbol.into());
+                let in_type_expression = self.in_type_expression;
+                self.in_type_expression = true;
                 if let Some(bounds) = bound {
                     self.visit_expr(bounds);
                 }
                 if let Some(default) = default {
                     self.visit_expr(default);
                 }
+                self.in_type_expression = in_type_expression;
                 match type_param {
                     ast::TypeParam::TypeVar(node) => self.add_definition(symbol.into(), node),
                     ast::TypeParam::ParamSpec(node) => self.add_definition(symbol.into(), node),
@@ -3454,11 +3467,84 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             .get_or_init(|| source_text(self.db, self.file.file(self.db)))
     }
 
+    /// Whether `expr` has the syntactic shape of a PEP 827 type-boolean operand: a name,
+    /// attribute, or subscript, or a `not`/`and`/`or` of such operands.
+    fn is_type_boolean_operand(expr: &ast::Expr) -> bool {
+        match expr {
+            ast::Expr::Name(_) | ast::Expr::Attribute(_) | ast::Expr::Subscript(_) => true,
+            ast::Expr::UnaryOp(ast::ExprUnaryOp {
+                op: ast::UnaryOp::Not,
+                operand,
+                ..
+            }) => Self::is_type_boolean_operand(operand),
+            ast::Expr::BoolOp(bool_op) => bool_op.values.iter().all(Self::is_type_boolean_operand),
+            _ => false,
+        }
+    }
+
+    /// Syntactic check for `Annotated` / `<module>.Annotated` as a subscript value.
+    fn is_annotated_special_form(expr: &ast::Expr) -> bool {
+        match expr {
+            ast::Expr::Name(name) => name.id == "Annotated",
+            ast::Expr::Attribute(attribute) => attribute.attr.id == "Annotated",
+            _ => false,
+        }
+    }
+
     fn visit_expr_with_context(&mut self, expr: &'ast ast::Expr, context: ExpressionContext) {
+        if self.in_type_expression
+            && (matches!(
+                expr,
+                ast::Expr::Lambda(_)
+                    | ast::Expr::ListComp(_)
+                    | ast::Expr::SetComp(_)
+                    | ast::Expr::DictComp(_)
+                    | ast::Expr::Generator(_)
+            ) || self
+                .value_expressions_in_type_expression
+                .remove(&ExpressionNodeKey::from(expr)))
+        {
+            // Nested scopes and `Annotated` metadata are value expressions, not type
+            // expressions; don't leak the flag into them.
+            self.in_type_expression = false;
+            self.visit_expr_with_context(expr, context);
+            self.in_type_expression = true;
+            return;
+        }
+
         self.with_semantic_checker(|semantic, builder| semantic.visit_expr(expr, builder));
 
         self.scopes_by_expression
             .record_expression(expr, self.current_scope());
+
+        if self.in_type_expression {
+            match expr {
+                ast::Expr::If(ast::ExprIf { test, .. }) if Self::is_type_boolean_operand(test) => {
+                    // PEP 827 conditional type: no runtime control flow to model.
+                    walk_expr(self, expr);
+                    return;
+                }
+                ast::Expr::BoolOp(_) | ast::Expr::UnaryOp(_)
+                    if Self::is_type_boolean_operand(expr) =>
+                {
+                    // PEP 827 type-level `and`/`or`/`not`: no runtime control flow to model.
+                    walk_expr(self, expr);
+                    return;
+                }
+                ast::Expr::Subscript(ast::ExprSubscript { value, slice, .. })
+                    if Self::is_annotated_special_form(value) =>
+                {
+                    // `Annotated[T, *metadata]`: the metadata are value expressions.
+                    if let ast::Expr::Tuple(tuple) = slice.as_ref() {
+                        for metadata in tuple.elts.iter().skip(1) {
+                            self.value_expressions_in_type_expression
+                                .insert(ExpressionNodeKey::from(metadata));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
 
         match expr {
             ast::Expr::Name(ast::ExprName { ctx, .. })
@@ -4015,7 +4101,10 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                     type_alias.type_params.as_deref(),
                     |builder| {
                         builder.push_scope(NodeWithScopeRef::TypeAlias(type_alias));
+                        let in_type_expression = builder.in_type_expression;
+                        builder.in_type_expression = true;
                         builder.visit_expr(&type_alias.value);
+                        builder.in_type_expression = in_type_expression;
                         builder.pop_scope()
                     },
                 );
@@ -5566,7 +5655,10 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
 impl<'ast> Visitor<'ast> for SemanticIndexBuilder<'_, 'ast> {
     fn visit_annotation(&mut self, expression: &'ast ast::Expr) {
         self.annotations.push(expression.node_index().load());
+        let in_type_expression = self.in_type_expression;
+        self.in_type_expression = true;
         self.visit_expr(expression);
+        self.in_type_expression = in_type_expression;
     }
 
     fn visit_stmt(&mut self, stmt: &'ast ast::Stmt) {

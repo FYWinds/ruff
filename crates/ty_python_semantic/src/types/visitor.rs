@@ -28,6 +28,7 @@ use crate::types::{
     subclass_of::walk_subclass_of_type,
     type_alias::walk_type_alias_type,
     type_form::walk_typeform_type,
+    type_operator::{TypeOperatorType, walk_type_operator_type},
     typed_dict::walk_typed_dict_type,
     typevar::{TypeVarInstance, walk_bound_type_var_type, walk_type_var_type},
     walk_property_instance_type, walk_typeguard_type, walk_typeis_type,
@@ -147,6 +148,10 @@ pub(crate) trait TypeVisitor<'db> {
         walk_newtype_instance_type(db, newtype, self);
     }
 
+    fn visit_type_operator_type(&self, db: &'db dyn Db, operator: TypeOperatorType<'db>) {
+        walk_type_operator_type(db, operator, self);
+    }
+
     fn visit_recursive_type(&self, db: &'db dyn Db, recursive: RecursiveType<'db>) {
         if self.should_visit_lazy_type_attributes() {
             self.visit_type(
@@ -179,6 +184,7 @@ pub(super) enum NonAtomicType<'db> {
     TypeIs(TypeIsType<'db>),
     TypeGuard(TypeGuardType<'db>),
     TypeForm(TypeFormType<'db>),
+    TypeOperator(TypeOperatorType<'db>),
     TypeVar(BoundTypeVarInstance<'db>),
     ProtocolInstance(ProtocolInstanceType<'db>),
     TypedDict(TypedDictType<'db>),
@@ -257,6 +263,9 @@ impl<'db> From<Type<'db>> for TypeKind<'db> {
                 TypeKind::NonAtomic(NonAtomicType::TypeGuard(type_guard))
             }
             Type::TypeForm(typeform) => TypeKind::NonAtomic(NonAtomicType::TypeForm(typeform)),
+            Type::TypeOperator(operator) => {
+                TypeKind::NonAtomic(NonAtomicType::TypeOperator(operator))
+            }
             Type::TypedDict(typed_dict) => {
                 TypeKind::NonAtomic(NonAtomicType::TypedDict(typed_dict))
             }
@@ -321,6 +330,9 @@ pub(super) fn walk_non_atomic_type<'db, V: TypeVisitor<'db> + ?Sized>(
         }
         NonAtomicType::TypeForm(typeform) => {
             visitor.visit_typeform_type(db, typeform);
+        }
+        NonAtomicType::TypeOperator(operator) => {
+            visitor.visit_type_operator_type(db, operator);
         }
         NonAtomicType::TypeVar(bound_typevar) => {
             visitor.visit_bound_type_var_type(db, bound_typevar);

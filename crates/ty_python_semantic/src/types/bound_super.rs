@@ -659,6 +659,9 @@ impl<'db> BoundSuperType<'db> {
                     },
                 ));
             }
+            Type::TypeOperator(operator) => {
+                return delegate_to(operator.upper_bound(db, env));
+            }
             Type::ClassLiteral(class) => SuperOwnerKind::Resolved(Self::resolve_class_super_owner(
                 db,
                 pivot_class,

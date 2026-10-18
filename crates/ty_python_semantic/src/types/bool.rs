@@ -244,6 +244,13 @@ impl<'db> Type<'db> {
                 .map(|unfolded| unfolded.try_bool_impl(db, env, allow_short_circuit, visitor))
                 .unwrap_or(Ok(Truthiness::Ambiguous))?,
 
+            Type::TypeOperator(operator) => operator.upper_bound(db, env).try_bool_impl(
+                db,
+                env,
+                allow_short_circuit,
+                visitor,
+            )?,
+
             Type::TypedDict(td) => {
                 if td.items(db).values().any(TypedDictField::is_required) {
                     Truthiness::AlwaysTrue

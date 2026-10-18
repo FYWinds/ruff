@@ -90,6 +90,12 @@ pub enum SpecialFormType {
     Not,
     /// The symbol `ty_extensions.Intersection`
     Intersection,
+    /// The symbol `ty_extensions.IsAssignable` (PEP 827 type boolean)
+    IsAssignable,
+    /// The symbol `ty_extensions.IsEquivalent` (PEP 827 type boolean)
+    IsEquivalent,
+    /// The symbol `ty_extensions.Bool` (PEP 827 type boolean)
+    Bool,
     /// The symbol `ty_extensions._internal.TypeOf`
     TypeOf,
     /// The symbol `ty_extensions._internal.CallableTypeOf`
@@ -162,6 +168,9 @@ impl SpecialFormType {
             | Self::Top
             | Self::Bottom
             | Self::Intersection
+            | Self::IsAssignable
+            | Self::IsEquivalent
+            | Self::Bool
             | Self::CallableTypeOf
             | Self::RegularCallableTypeOf
             | Self::Unknown
@@ -315,6 +324,9 @@ impl SpecialFormType {
             AlwaysFalsy,
             Not,
             Intersection,
+            IsAssignable,
+            IsEquivalent,
+            Bool,
             TypeOf,
             CallableTypeOf,
             RegularCallableTypeOf,
@@ -363,6 +375,9 @@ impl SpecialFormType {
                     SpecialFormType::RegularCallableTypeOf => Self::RegularCallableTypeOf,
                     SpecialFormType::Concatenate => Self::Concatenate,
                     SpecialFormType::Intersection => Self::Intersection,
+                    SpecialFormType::IsAssignable => Self::IsAssignable,
+                    SpecialFormType::IsEquivalent => Self::IsEquivalent,
+                    SpecialFormType::Bool => Self::Bool,
                     SpecialFormType::Literal => Self::Literal,
                     SpecialFormType::LiteralString => Self::LiteralString,
                     SpecialFormType::Never => Self::Never,
@@ -424,6 +439,9 @@ impl SpecialFormType {
                     SpecialFormTypeBuilder::RegularCallableTypeOf => &[Self::RegularCallableTypeOf],
                     SpecialFormTypeBuilder::Concatenate => &[Self::Concatenate],
                     SpecialFormTypeBuilder::Intersection => &[Self::Intersection],
+                    SpecialFormTypeBuilder::IsAssignable => &[Self::IsAssignable],
+                    SpecialFormTypeBuilder::IsEquivalent => &[Self::IsEquivalent],
+                    SpecialFormTypeBuilder::Bool => &[Self::Bool],
                     SpecialFormTypeBuilder::Literal => &[Self::Literal],
                     SpecialFormTypeBuilder::LiteralString => &[Self::LiteralString],
                     SpecialFormTypeBuilder::Never => &[Self::Never],
@@ -540,7 +558,10 @@ impl SpecialFormType {
             | Self::Not
             | Self::Top
             | Self::Bottom
-            | Self::Intersection => module.is_ty_extensions(),
+            | Self::Intersection
+            | Self::IsAssignable
+            | Self::IsEquivalent
+            | Self::Bool => module.is_ty_extensions(),
 
             Self::Unknown
             | Self::Divergent
@@ -616,6 +637,9 @@ impl SpecialFormType {
             | Self::Top
             | Self::Bottom
             | Self::Intersection
+            | Self::IsAssignable
+            | Self::IsEquivalent
+            | Self::Bool
             | Self::TypeOf
             | Self::CallableTypeOf
             | Self::RegularCallableTypeOf
@@ -655,6 +679,9 @@ impl SpecialFormType {
             | Self::RegularCallableTypeOf
             | Self::Concatenate
             | Self::Intersection
+            | Self::IsAssignable
+            | Self::IsEquivalent
+            | Self::Bool
             | Self::Literal
             | Self::LiteralString
             | Self::Never
@@ -720,6 +747,9 @@ impl SpecialFormType {
             SpecialFormType::AlwaysFalsy => "AlwaysFalsy",
             SpecialFormType::Not => "Not",
             SpecialFormType::Intersection => "Intersection",
+            SpecialFormType::IsAssignable => "IsAssignable",
+            SpecialFormType::IsEquivalent => "IsEquivalent",
+            SpecialFormType::Bool => "Bool",
             SpecialFormType::TypeOf => "TypeOf",
             SpecialFormType::CallableTypeOf => "CallableTypeOf",
             SpecialFormType::RegularCallableTypeOf => "RegularCallableTypeOf",
@@ -772,6 +802,9 @@ impl SpecialFormType {
             | SpecialFormType::AlwaysFalsy
             | SpecialFormType::Not
             | SpecialFormType::Intersection
+            | SpecialFormType::IsAssignable
+            | SpecialFormType::IsEquivalent
+            | SpecialFormType::Bool
             | SpecialFormType::Top
             | SpecialFormType::Bottom => &[KnownModule::TyExtensions],
 
@@ -926,12 +959,13 @@ impl SpecialFormType {
                 Err(InvalidTypeExpression::Concatenate)
             }
 
-            Self::Concatenate | Self::Annotated => {
+            Self::Concatenate | Self::Annotated | Self::IsAssignable | Self::IsEquivalent => {
                 Err(InvalidTypeExpression::RequiresTwoArguments(self))
             }
 
             Self::Optional
             | Self::Not
+            | Self::Bool
             | Self::Top
             | Self::Bottom
             | Self::TypeOf

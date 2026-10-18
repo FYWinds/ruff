@@ -178,6 +178,9 @@ impl<'db> AllMembers<'db> {
             Type::RecursiveVar(_) => {
                 unreachable!("semantic operation on an unbound recursive variable")
             }
+            Type::TypeOperator(operator) => {
+                self.extend_with_type(db, env, operator.upper_bound(db, env));
+            }
             Type::Union(union) => {
                 fn is_dynamic(db: &dyn Db, ty: Type<'_>) -> bool {
                     // We don't need to use recursion here because

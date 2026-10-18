@@ -104,6 +104,7 @@ use crate::types::special_form::TypeQualifier;
 use crate::types::tuple::TupleSpec;
 pub use crate::types::type_alias::TypeAliasType;
 pub use crate::types::type_form::TypeFormType;
+pub use crate::types::type_operator::TypeOperatorType;
 pub(crate) use crate::types::typed_dict::TypedDictType;
 pub(crate) use crate::types::typevar::{
     BindingContext, BoundTypeVarIdentity, ParamSpecAttrKind, TypeVarBoundOrConstraints,
@@ -181,6 +182,7 @@ mod tuple;
 mod type_alias;
 mod type_expansion;
 mod type_form;
+mod type_operator;
 mod typed_dict;
 mod typevar;
 mod unpacker;
@@ -2083,6 +2085,10 @@ pub enum Type<'db> {
     TypeGuard(TypeGuardType<'db>),
     /// The set of type-form objects that represent a type assignable to the argument.
     TypeForm(TypeFormType<'db>),
+    /// An unresolved PEP 827 type operator (a type boolean or a conditional type) whose operands
+    /// contain unsolved type variables. Resolvable operators are evaluated eagerly and never
+    /// appear as this variant.
+    TypeOperator(TypeOperatorType<'db>),
     /// A type that represents an inhabitant of a `TypedDict`.
     TypedDict(TypedDictType<'db>),
     /// An aliased type (lazily not-yet-unpacked to its value type).
@@ -3290,6 +3296,7 @@ impl<'db> Type<'db> {
             | Type::TypeIs(_)
             | Type::TypeGuard(_)
             | Type::TypeForm(_)
+            | Type::TypeOperator(_)
             | Type::TypeVar(_)
             | Type::TypedDict(_)
             | Type::NewTypeInstance(_)
@@ -3351,6 +3358,8 @@ impl<'db> Type<'db> {
             // Revisit this and `is_hintable` when general recursive type inference can produce
             // types without a declared alias.
             Type::TypeAlias(_) | Type::Recursive(_) => true,
+            // Unresolved type operators are displayed in their (spellable) source form.
+            Type::TypeOperator(_) => true,
             Type::TypeForm(typeform) => typeform.type_argument(db).is_spellable(db),
             Type::Intersection(_) => false,
             Type::EnumComplement(complement) => complement.is_spellable(db),
@@ -3402,6 +3411,7 @@ impl<'db> Type<'db> {
             | Type::TypeIs(_)
             | Type::TypeGuard(_)
             | Type::TypeForm(_)
+            | Type::TypeOperator(_)
             | Type::PropertyInstance(_)
             | Type::SlotDescriptor(_)
             | Type::FunctionLiteral(_)
@@ -3850,6 +3860,9 @@ impl<'db> Type<'db> {
                 .type_argument(db)
                 .recursive_type_normalized_impl(db, env, div, true)
                 .map(|ty| TypeFormType::from_type_expression(db, ty)),
+            Type::TypeOperator(operator) => operator
+                .recursive_type_normalized_impl(db, env, div, nested)
+                .map(Type::TypeOperator),
             Type::Divergent(_) => Some(self),
             Type::Dynamic(dynamic) => Some(Type::Dynamic(dynamic.recursive_type_normalized())),
             Type::TypedDict(typed_dict) => typed_dict
@@ -3970,6 +3983,9 @@ impl<'db> Type<'db> {
                 unreachable!("semantic operation on an unbound recursive variable")
             }
             Type::Dynamic(_) | Type::Divergent(_) | Type::Never => false,
+            // Unresolved type booleans are `Literal[True]` or `Literal[False]`, but which one is
+            // unknown; unresolved conditional types are not known to be singletons.
+            Type::TypeOperator(_) => false,
             Type::Recursive(recursive) => recursive
                 .unfold(db, env)
                 .is_unfolded_and(|unfolded| unfolded.is_singleton(db, env)),
@@ -4248,6 +4264,7 @@ impl<'db> Type<'db> {
             | Type::TypeIs(_)
             | Type::TypeGuard(_)
             | Type::TypeForm(_)
+            | Type::TypeOperator(_)
             | Type::TypedDict(_)
             | Type::EnumComplement(_)
             | Type::NewTypeInstance(_) => None,
@@ -4719,6 +4736,10 @@ impl<'db> Type<'db> {
             Type::Union(union) => union.map_with_boundness_and_qualifiers(db, env, |elem| {
                 elem.instance_member(db, env, name)
             }),
+
+            Type::TypeOperator(operator) => {
+                operator.upper_bound(db, env).instance_member(db, env, name)
+            }
 
             Type::Intersection(intersection) => {
                 if let Some(complement) = intersection.enum_complement(db, env) {
@@ -5947,6 +5968,9 @@ impl<'db> Type<'db> {
                         )
                     })
                     .unwrap_or(Place::bound(Type::unknown()).into()),
+                Type::TypeOperator(operator) => operator
+                    .upper_bound(db, env)
+                    .member_lookup_with_policy_and_receiver(db, env, name_str, policy, receiver),
                 Type::RecursiveVar(_) => {
                     unreachable!("semantic operation on an unbound recursive variable")
                 }
@@ -7378,6 +7402,13 @@ impl<'db> Type<'db> {
                     .bindings_with_receiver(db, env, recursion_guard, receiver)
             }
 
+            Type::TypeOperator(operator) => operator.upper_bound(db, env).bindings_with_receiver(
+                db,
+                env,
+                recursion_guard,
+                receiver,
+            ),
+
             Type::PropertyInstance(_)
             | Type::SlotDescriptor(_)
             | Type::AlwaysFalsy
@@ -8768,6 +8799,7 @@ impl<'db> Type<'db> {
             | Type::TypeIs(_)
             | Type::TypeGuard(_)
             | Type::TypeForm(_)
+            | Type::TypeOperator(_)
             | Type::TypedDict(_)
             | Type::EnumComplement(_)
             | Type::NewTypeInstance(_) => None,
@@ -8855,6 +8887,7 @@ impl<'db> Type<'db> {
             | Type::TypeIs(_)
             | Type::TypeGuard(_)
             | Type::TypeForm(_)
+            | Type::TypeOperator(_)
             | Type::TypedDict(_) => Err(InvalidTypeExpressionError {
                 invalid_expressions: smallvec_inline![InvalidTypeExpression::InvalidType(
                     *self, scope_id
@@ -9113,6 +9146,9 @@ impl<'db> Type<'db> {
                 }),
                 Type::TypeIs(_) | Type::TypeGuard(_) => KnownClass::Bool.to_class_literal(db, env),
                 Type::TypeForm(_) => to_meta_type_inner(db, env, Type::object(), context, visitor),
+                Type::TypeOperator(operator) => {
+                    to_meta_type_inner(db, env, operator.upper_bound(db, env), context, visitor)
+                }
                 Type::LiteralValue(literal) => match literal.kind() {
                     LiteralValueTypeKind::Bool(_) => KnownClass::Bool.to_class_literal(db, env),
                     LiteralValueTypeKind::Bytes(_) => KnownClass::Bytes.to_class_literal(db, env),
@@ -9802,6 +9838,10 @@ impl<'db> Type<'db> {
 
             Type::TypeAlias(alias) => alias.apply_type_mapping_impl(db, type_mapping, tcx, visitor),
 
+            Type::TypeOperator(operator) => {
+                operator.apply_type_mapping_impl(db, type_mapping, tcx, visitor)
+            }
+
             Type::LiteralValue(_) => match type_mapping {
                 TypeMapping::ApplySpecialization(_)
                 | TypeMapping::ApplySpecializationWithMaterialization { .. }
@@ -10126,6 +10166,20 @@ impl<'db> Type<'db> {
                 );
             }
 
+            Type::TypeOperator(operator) => {
+                visitor.visit(db, self, || {
+                    operator.for_each_operand(db, |operand| {
+                        operand.find_legacy_typevars_impl(
+                            db,
+                            env,
+                            binding_context,
+                            typevars,
+                            visitor,
+                        );
+                    });
+                });
+            }
+
             Type::TypeAlias(alias) => {
                 visitor.visit(db, self, || {
                     alias.value_type(db).find_legacy_typevars_impl(
@@ -10397,6 +10451,7 @@ impl<'db> Type<'db> {
             Type::RecursiveVar(_) => {
                 unreachable!("semantic operation on an unbound recursive variable")
             }
+            Self::TypeOperator(_) => None,
             Self::BoundMethod(method) => method.func(db).definition(db, env),
             Self::FunctionLiteral(function) => {
                 Some(TypeDefinition::Function(function.definition(db)))
@@ -11004,6 +11059,7 @@ impl<'db> VarianceInferable<'db> for Type<'db> {
             Type::TypeIs(type_is_type) => type_is_type.variance_of(db, env, typevar),
             Type::TypeGuard(type_guard_type) => type_guard_type.variance_of(db, env, typevar),
             Type::TypeForm(typeform_type) => typeform_type.variance_of(db, env, typevar),
+            Type::TypeOperator(operator) => operator.variance_of(db, env, typevar),
             Type::KnownInstance(known_instance) => known_instance.variance_of(db, env, typevar),
             Type::TypeAlias(alias) => alias.variance_of(db, env, typevar),
             Type::Dynamic(_)

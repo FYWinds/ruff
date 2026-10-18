@@ -160,6 +160,7 @@ pub mod list_members;
 mod literal;
 mod match_pattern;
 mod member;
+pub(crate) mod member_introspection;
 mod method;
 mod mro;
 pub(crate) mod narrow;

@@ -807,6 +807,43 @@ impl<'db> ProtocolInterface<'db> {
         Self::new(db, env.program(db), members)
     }
 
+    /// Synthesize a new protocol interface from PEP 827 `Member` descriptions
+    /// (`NewProtocol[...]`).
+    ///
+    /// Each member is given as `(name, type, qualifiers)`. A `ClassVar` whose type is callable
+    /// becomes a method member; every other member becomes an attribute member carrying the
+    /// `ClassVar`/`Final` qualifiers. Later members with the same name replace earlier ones.
+    pub(super) fn from_members<M>(db: &'db dyn Db, program: Program<'db>, members: M) -> Self
+    where
+        M: IntoIterator<Item = (Name, Type<'db>, TypeQualifiers)>,
+    {
+        let members: BTreeMap<_, _> = members
+            .into_iter()
+            .map(|(name, ty, qualifiers)| {
+                let method = if qualifiers.contains(TypeQualifiers::CLASS_VAR) {
+                    match ty {
+                        Type::Callable(callable) => Some(callable),
+                        Type::FunctionLiteral(function) => Some(function.into_callable_type(db)),
+                        Type::BoundMethod(method) => method.into_callable_type(db),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                let member = match method {
+                    Some(callable) => ProtocolMemberData::method(db, callable, None),
+                    None => ProtocolMemberData::attribute(
+                        ty,
+                        qualifiers & (TypeQualifiers::CLASS_VAR | TypeQualifiers::FINAL),
+                        None,
+                    ),
+                };
+                (name, member)
+            })
+            .collect();
+        Self::new(db, program, members)
+    }
+
     fn empty(db: &'db dyn Db, env: &ProgramEnvironment<'db>) -> Self {
         Self::new(db, env.program(db), BTreeMap::default())
     }

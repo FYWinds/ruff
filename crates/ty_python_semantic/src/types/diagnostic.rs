@@ -1648,6 +1648,7 @@ pub(crate) fn is_invalid_typed_dict_literal<'db>(
     source: AnyNodeRef<'_>,
 ) -> bool {
     target_ty
+        .resolve_type_alias(db)
         .filter_union(db, env, Type::is_typed_dict)
         .as_typed_dict()
         .is_some()

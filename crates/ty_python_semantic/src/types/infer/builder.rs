@@ -178,6 +178,7 @@ mod post_inference;
 mod subscript;
 mod suspicious_conditions;
 mod type_call;
+mod type_comprehension;
 mod type_expression;
 mod type_form;
 mod type_operator;
@@ -300,6 +301,11 @@ pub(super) struct TypeInferenceBuilder<'db, 'ast> {
     /// Metadata for type expressions.
     /// Only populated for expressions that have non-empty flags.
     type_expression_flags: FxHashMap<ExpressionNodeKey, TypeExpressionFlags>,
+
+    /// The loop variables of the PEP 827 type comprehensions that enclose the type expression
+    /// currently being inferred, innermost last. Names in this stack resolve to their synthetic
+    /// binder type variable instead of being looked up as places.
+    type_binders: Vec<(Name, BoundTypeVarInstance<'db>)>,
 
     /// The constraints on any collection initializers that are accessed in this region.
     //
@@ -519,6 +525,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             reachability_cache: OnceCell::new(),
             qualifiers: FxHashMap::default(),
             type_expression_flags: FxHashMap::default(),
+            type_binders: Vec::new(),
             collection_use_constraints: FxHashMap::default(),
             string_annotations: FxHashSet::default(),
             expected_types: FxHashMap::default(),
@@ -10669,6 +10676,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         &mut self,
         name_node: &ast::ExprName,
     ) -> (Type<'db>, Option<Definition<'db>>) {
+        if let Some(binder) = self.type_binder(&name_node.id) {
+            return (Type::TypeVar(binder), None);
+        }
         let db = self.db();
         let expr = PlaceExpr::from_expr_name(name_node);
 
@@ -12066,6 +12076,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             comparison_truthiness,
             qualifiers: _,
             type_expression_flags,
+            type_binders: _,
             collection_use_constraints,
             string_annotations,
             expected_types,
@@ -12131,6 +12142,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             comparison_truthiness,
             qualifiers,
             type_expression_flags,
+            type_binders: _,
             mut collection_use_constraints,
             string_annotations,
             expected_types,
@@ -12271,6 +12283,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             cycle_recovery: _,
             qualifiers: _,
             type_expression_flags: _,
+            type_binders: _,
         } = self;
         let diagnostics = context.finish();
 
@@ -12304,6 +12317,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             comparison_truthiness,
             qualifiers,
             type_expression_flags,
+            type_binders: _,
             mut collection_use_constraints,
             string_annotations,
             expected_types,
@@ -12499,6 +12513,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             string_annotations,
             expected_types,
             type_expression_flags,
+            type_binders: _,
             mut collection_use_constraints,
             expressions,
             comparison_truthiness: _,
@@ -12602,6 +12617,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             discards_dict_key_assignments: _,
             qualifiers: _,
             type_expression_flags: _,
+            ref type_binders,
         } = *self;
 
         let mut builder = TypeInferenceBuilder::new(
@@ -12630,6 +12646,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         builder
             .dataclass_field_specifiers
             .clone_from(dataclass_field_specifiers);
+        builder.type_binders.clone_from(type_binders);
 
         builder
     }
@@ -12653,6 +12670,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             expressions,
             comparison_truthiness,
             type_expression_flags,
+            type_binders: _,
             collection_use_constraints,
             string_annotations,
             expected_types,

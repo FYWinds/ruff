@@ -243,8 +243,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             }
         }
 
-        let tuple_generic_alias = |tuple: TupleType<'db>| Type::from(tuple.to_class_type(db));
-
         match value_ty {
             Type::ClassLiteral(class) => {
                 // HACK ALERT: If we are subscripting a generic class, short-circuit the rest of the
@@ -254,9 +252,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 // updating all of the subscript logic below to use custom callables for all of the _other_
                 // special cases, too.
                 if class.is_tuple(db) {
-                    return Ok(tuple_generic_alias(
-                        self.infer_tuple_type_expression(subscript),
-                    ));
+                    return Ok(self.infer_tuple_subscript_value(subscript));
                 } else if class.is_known(db, KnownClass::Type) {
                     let argument_ty = self.infer_type_expression(slice);
                     return Ok(Type::KnownInstance(KnownInstanceType::TypeGenericAlias(
@@ -287,9 +283,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             }
             Type::SpecialForm(special_form) => match special_form {
                 SpecialFormType::Tuple => {
-                    return Ok(tuple_generic_alias(
-                        self.infer_tuple_type_expression(subscript),
-                    ));
+                    return Ok(self.infer_tuple_subscript_value(subscript));
                 }
                 SpecialFormType::Literal => match self.infer_literal_parameter_type(slice) {
                     Ok(result) => {

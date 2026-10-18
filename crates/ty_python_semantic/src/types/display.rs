@@ -30,7 +30,7 @@ use crate::types::recursive::RecursiveType;
 use crate::types::signatures::{Parameter, Parameters, ParametersKind, Signature};
 use crate::types::tuple::{TupleSpec, VariableSegment};
 use crate::types::type_alias::QualifiedTypeAliasName;
-use crate::types::type_operator::{TypeOperatorKind, TypeOperatorType};
+use crate::types::type_operator::{TypeOperatorKind, TypeOperatorType, VariadicArg};
 use crate::types::typevar::BoundTypeVarIdentity;
 use crate::types::visitor::TypeVisitor;
 use crate::types::{
@@ -1152,7 +1152,18 @@ fn type_operator_precedence<'db>(db: &'db dyn Db, ty: Type<'db>) -> u8 {
             TypeOperatorKind::Not(_) => 3,
             TypeOperatorKind::IsAssignable(..)
             | TypeOperatorKind::IsEquivalent(..)
-            | TypeOperatorKind::Bool(_) => 4,
+            | TypeOperatorKind::Bool(_)
+            | TypeOperatorKind::Attrs(_)
+            | TypeOperatorKind::Members(_)
+            | TypeOperatorKind::GetMember(..)
+            | TypeOperatorKind::GetMemberType(..)
+            | TypeOperatorKind::FromUnion(_)
+            | TypeOperatorKind::MemberAccess(..)
+            | TypeOperatorKind::UnpackMap { .. }
+            | TypeOperatorKind::TupleOf(_)
+            | TypeOperatorKind::UnionOf(_)
+            | TypeOperatorKind::NewProtocol(_)
+            | TypeOperatorKind::NewTypedDict(_) => 4,
         },
         _ => 4,
     }
@@ -1191,6 +1202,41 @@ fn fmt_type_operator<'db>(
                 f.write_str(", ")?;
             }
             operand(f, *ty, 0)?;
+        }
+        f.write_char(']')
+    };
+    let variadic = |f: &mut TypeWriter<'_, '_, 'db>,
+                    name: &str,
+                    form: Option<SpecialFormType>,
+                    args: &[VariadicArg<'db>]|
+     -> fmt::Result {
+        match form {
+            Some(form) => f.with_type(Type::SpecialForm(form)).write_str(name)?,
+            None => f.write_str(name)?,
+        }
+        f.write_char('[')?;
+        if args.is_empty() {
+            f.write_str("()")?;
+        }
+        for (index, arg) in args.iter().enumerate() {
+            if index > 0 {
+                f.write_str(", ")?;
+            }
+            match arg {
+                VariadicArg::Single(ty) => operand(f, *ty, 0)?,
+                VariadicArg::Unpacked(ty) => {
+                    // An unpacked comprehension already displays its own `*`.
+                    let is_comprehension = matches!(
+                        ty,
+                        Type::TypeOperator(inner)
+                            if matches!(inner.kind(db), TypeOperatorKind::UnpackMap { .. })
+                    );
+                    if !is_comprehension {
+                        f.write_char('*')?;
+                    }
+                    operand(f, *ty, 0)?;
+                }
+            }
         }
         f.write_char(']')
     };
@@ -1233,6 +1279,56 @@ fn fmt_type_operator<'db>(
             f.write_str(" else ")?;
             operand(f, *if_false, 0)
         }
+        TypeOperatorKind::Attrs(ty) => special_form(f, SpecialFormType::Attrs, &[*ty]),
+        TypeOperatorKind::Members(ty) => special_form(f, SpecialFormType::Members, &[*ty]),
+        TypeOperatorKind::GetMember(ty, name) => {
+            special_form(f, SpecialFormType::GetMember, &[*ty, *name])
+        }
+        TypeOperatorKind::GetMemberType(ty, name) => {
+            special_form(f, SpecialFormType::GetMemberType, &[*ty, *name])
+        }
+        TypeOperatorKind::FromUnion(ty) => special_form(f, SpecialFormType::FromUnion, &[*ty]),
+        TypeOperatorKind::MemberAccess(ty, field) => {
+            operand(f, *ty, 4)?;
+            f.write_char('.')?;
+            f.write_str(field.as_str())
+        }
+        TypeOperatorKind::UnpackMap {
+            iterable,
+            binder,
+            body,
+            conditions,
+        } => {
+            f.write_str("*[")?;
+            operand(f, *body, 1)?;
+            f.write_str(" for ")?;
+            f.write_str(binder.typevar(db).name(db))?;
+            f.write_str(" in ")?;
+            f.with_type(Type::SpecialForm(SpecialFormType::Iter))
+                .write_str(SpecialFormType::Iter.name())?;
+            f.write_char('[')?;
+            operand(f, *iterable, 0)?;
+            f.write_char(']')?;
+            for condition in conditions {
+                f.write_str(" if ")?;
+                operand(f, *condition, 1)?;
+            }
+            f.write_char(']')
+        }
+        TypeOperatorKind::TupleOf(args) => variadic(f, "tuple", None, args),
+        TypeOperatorKind::UnionOf(args) => variadic(f, "Union", Some(SpecialFormType::Union), args),
+        TypeOperatorKind::NewProtocol(args) => variadic(
+            f,
+            SpecialFormType::NewProtocol.name(),
+            Some(SpecialFormType::NewProtocol),
+            args,
+        ),
+        TypeOperatorKind::NewTypedDict(args) => variadic(
+            f,
+            SpecialFormType::NewTypedDict.name(),
+            Some(SpecialFormType::NewTypedDict),
+            args,
+        ),
     }
 }
 

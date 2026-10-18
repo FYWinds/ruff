@@ -3,9 +3,15 @@
 
 import collections.abc
 import sys
-from typing import Any, ClassVar, Protocol, _SpecialForm
+from typing import Any, ClassVar, Generic, Literal, Protocol, _SpecialForm, final
 
-from typing_extensions import LiteralString, Self  # ruff: ignore[deprecated-import]
+from typing_extensions import (  # ruff: ignore[deprecated-import]
+    LiteralString,
+    Never,
+    Self,
+    TypeAlias,
+    TypeVar,
+)
 
 from ._internal import TypeOf as _TypeOf
 
@@ -92,6 +98,119 @@ This allows a type alias whose value is a type boolean to be used where a type b
 
 [PEP 827]: https://peps.python.org/pep-0827/
 """
+
+Iter: _SpecialForm
+"""
+`Iter[T]` is an experimental [PEP 827] form that iterates over the elements of the fixed-length
+tuple type `T`. It may only appear as the iterable of the `for` clause of an unpacked list
+comprehension in a variadic position of a type expression:
+
+```python
+type Names[T] = tuple[*[m.name for m in Iter[Attrs[T]]]]
+```
+
+Iterating over `Never` produces no elements; iterating over `Any` produces an unknown number of
+`Any` elements.
+
+[PEP 827]: https://peps.python.org/pep-0827/
+"""
+
+Attrs: _SpecialForm
+"""
+`Attrs[T]` is an experimental [PEP 827] operator: a tuple of `Member` types describing the
+annotated attributes of the class `T` (excluding methods), from the most basic base class to `T`
+itself. Unions are distributed over.
+
+[PEP 827]: https://peps.python.org/pep-0827/
+"""
+
+Members: _SpecialForm
+"""
+`Members[T]` is an experimental [PEP 827] operator: like `Attrs[T]`, but it also includes the
+annotated methods of `T` (after the attributes). Unions are distributed over.
+
+[PEP 827]: https://peps.python.org/pep-0827/
+"""
+
+GetMember: _SpecialForm
+"""
+`GetMember[T, S]` is an experimental [PEP 827] operator: the `Member` type describing the member
+named by the string literal type `S` in `Members[T]`. It is an error if there is no such member.
+Unions are distributed over.
+
+[PEP 827]: https://peps.python.org/pep-0827/
+"""
+
+GetMemberType: _SpecialForm
+"""
+`GetMemberType[T, S]` is an experimental [PEP 827] operator: the type of the member named by the
+string literal type `S` in `Members[T]`, or `Never` if there is no such member. Unions are
+distributed over.
+
+[PEP 827]: https://peps.python.org/pep-0827/
+"""
+
+FromUnion: _SpecialForm
+"""
+`FromUnion[T]` is an experimental [PEP 827] operator: a tuple of the elements of the union `T`
+(a one-element tuple if `T` is not a union, and an empty tuple if `T` is `Never`).
+
+[PEP 827]: https://peps.python.org/pep-0827/
+"""
+
+NewProtocol: _SpecialForm
+"""
+`NewProtocol[*Ms]` is an experimental [PEP 827] operator: a new structural protocol type with the
+members described by the `Member` types `Ms`. Members qualified with `ClassVar` whose type is
+callable become methods; other members become attributes.
+
+```python
+type Partial[T] = NewProtocol[*[Member[m.name, m.type | None] for m in Iter[Attrs[T]]]]
+```
+
+[PEP 827]: https://peps.python.org/pep-0827/
+"""
+
+NewTypedDict: _SpecialForm
+"""
+`NewTypedDict[*Ms]` is an experimental [PEP 827] operator: a new `TypedDict` type with the items
+described by the `Member` types `Ms`. The `NotRequired` and `ReadOnly` qualifiers are respected.
+
+[PEP 827]: https://peps.python.org/pep-0827/
+"""
+
+MemberQuals: TypeAlias = Literal["ClassVar", "Final", "NotRequired", "ReadOnly"]
+"""The qualifiers that can appear in the `Q` argument of an experimental [PEP 827] `Member`."""
+
+_MemberN = TypeVar("_MemberN", bound=str, covariant=True)
+_MemberT = TypeVar("_MemberT", covariant=True)
+_MemberQ = TypeVar("_MemberQ", bound=MemberQuals, default=Never, covariant=True)
+_MemberI = TypeVar("_MemberI", default=Never, covariant=True)
+_MemberD = TypeVar("_MemberD", default=Never, covariant=True)
+
+@final
+class Member(Generic[_MemberN, _MemberT, _MemberQ, _MemberI, _MemberD]):
+    """
+    `Member[N, T, Q, I, D]` is an experimental [PEP 827] description of a class member: its name
+    `N` (a string literal type), its type `T`, its qualifiers `Q` (a union of `MemberQuals`
+    literals), the type of its initializer `I`, and the class `D` that defines it.
+
+    In type expressions, the components can be accessed with `m.name`, `m.type`, `m.quals`,
+    `m.init` and `m.definer`.
+
+    [PEP 827]: https://peps.python.org/pep-0827/
+    """
+
+    @property
+    def name(self) -> _MemberN: ...
+    @property
+    def type(self) -> _MemberT: ...
+    @property
+    def quals(self) -> _MemberQ: ...
+    @property
+    def init(self) -> _MemberI: ...
+    @property
+    def definer(self) -> _MemberD: ...
 
 Top: _SpecialForm
 """

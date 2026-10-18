@@ -330,3 +330,326 @@ def f(
 ):
     pass
 ```
+
+## Mapping over a tuple
+
+[//]: # (playground: slug=tuple-map, phase=2, ts="type Lists<T extends unknown[]> = { [I in keyof T]: T[I][] }")
+
+A type comprehension `*[... for t in Iter[...]]` maps every element of a tuple type to a new type,
+and `if` clauses filter the elements. The result can be spliced into `tuple[...]` or `Union[...]`.
+
+```toml
+[environment]
+python-version = "3.14"
+```
+
+```py
+from typing import TYPE_CHECKING, Union
+
+if TYPE_CHECKING:
+    from ty_extensions import IsAssignable, Iter
+
+type Lists[T] = tuple[*[list[t] for t in Iter[T]]]
+type Numbers[T] = Union[*[t for t in Iter[T] if IsAssignable[t, int | float]]]
+
+def f(a: Lists[tuple[int, str]], b: Numbers[tuple[int, str, float, bytes]]):
+    reveal_type(a)  # revealed: tuple[list[int], list[str]]
+    # A `float` annotation already means `int | float`, so ty displays this union as `float`.
+    reveal_type(b)  # revealed: float
+```
+
+## Inspecting attributes
+
+[//]: # (playground: slug=attrs-introspection, phase=2, ts="keyof T and T[K], but as a tuple of members")
+
+`Attrs[T]` is a tuple with one `Member` per annotated attribute of a class: its name, type,
+qualifiers, initializer and defining class. `Members[T]` adds the methods, after the attributes.
+
+```toml
+[environment]
+python-version = "3.14"
+```
+
+```py
+from typing import TYPE_CHECKING, ClassVar
+
+if TYPE_CHECKING:
+    from ty_extensions import Attrs, Members
+
+class Point:
+    x: int
+    y: int = 0
+    dims: ClassVar[int] = 2
+
+    def norm(self) -> float:
+        return (self.x**2 + self.y**2) ** 0.5
+
+def f(attrs: Attrs[Point], members: Members[Point]):
+    # revealed: tuple[Member[Literal["x"], int, Never, Never, Point], Member[Literal["y"], int, Never, Literal[0], Point], Member[Literal["dims"], int, Literal["ClassVar"], Literal[2], Point]]
+    reveal_type(attrs)
+    reveal_type(len(members))  # revealed: Literal[4]
+    reveal_type(members[3].name)  # revealed: Literal["norm"]
+```
+
+## Member components
+
+[//]: # (playground: slug=member-access, phase=2, ts="{ [K in keyof T]: K }")
+
+Inside a comprehension, `m.name`, `m.type`, `m.quals`, `m.init` and `m.definer` read the components
+of a `Member`. `GetMember[T, Literal["x"]]` looks up a single member by name.
+
+```toml
+[environment]
+python-version = "3.14"
+```
+
+```py
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from ty_extensions import Attrs, GetMember, Iter
+
+class User:
+    id: int
+    name: str = "anonymous"
+
+type Names[T] = tuple[*[m.name for m in Iter[Attrs[T]]]]
+type Types[T] = tuple[*[m.type for m in Iter[Attrs[T]]]]
+
+def f(names: Names[User], types: Types[User], name: GetMember[User, Literal["name"]]):
+    reveal_type(names)  # revealed: tuple[Literal["id"], Literal["name"]]
+    reveal_type(types)  # revealed: tuple[int, str]
+    reveal_type(name)  # revealed: Member[Literal["name"], str, Never, Literal["anonymous"], User]
+```
+
+## `keyof`
+
+[//]: # (playground: slug=keyof, phase=2, ts="keyof T")
+
+`KeyOf[T]` collects the names of all members into a union of string literals, using the variadic
+`Union[*...]`.
+
+```toml
+[environment]
+python-version = "3.14"
+```
+
+```py
+from typing import TYPE_CHECKING, Union
+
+if TYPE_CHECKING:
+    from ty_extensions import Iter, Members
+
+type KeyOf[T] = Union[*[p.name for p in Iter[Members[T]]]]
+
+class Todo:
+    title: str
+    completed: bool
+
+    def toggle(self) -> None:
+        self.completed = not self.completed
+
+def keys_of[T](obj: T) -> KeyOf[T]:
+    raise NotImplementedError
+
+def f(todo: Todo):
+    reveal_type(keys_of(todo))  # revealed: Literal["title", "completed", "toggle"]
+```
+
+## Typed property access
+
+[//]: # (playground: slug=typed-getter, phase=2, ts="function get<T, K extends keyof T>(obj: T, key: K): T[K]")
+
+`GetMemberType[T, K]` is the type of the member named `K`. In a generic function, it is evaluated at
+each call site with the inferred key. A missing key gives `Never`.
+
+```toml
+[environment]
+python-version = "3.14"
+```
+
+```py
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ty_extensions import GetMemberType
+
+class User:
+    name: str
+    age: int
+
+def get[T, K: str](obj: T, key: K) -> GetMemberType[T, K]:
+    return getattr(obj, key)
+
+def f(user: User):
+    reveal_type(get(user, "name"))  # revealed: str
+    reveal_type(get(user, "age"))  # revealed: int
+```
+
+## `Pick` and `Omit`
+
+[//]: # (playground: slug=pick-omit, phase=2, ts="Pick<T, K> / Omit<T, K>")
+
+`NewProtocol[*members]` creates a structural type from members. Filtering the members of a class by
+name gives TypeScript's `Pick` and `Omit`. The class itself satisfies both.
+
+```toml
+[environment]
+python-version = "3.14"
+```
+
+```py
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from ty_extensions import IsAssignable, Iter, Members, NewProtocol
+
+type Pick[T, Keys] = NewProtocol[*[p for p in Iter[Members[T]] if IsAssignable[p.name, Keys]]]
+type Omit[T, Keys] = NewProtocol[*[p for p in Iter[Members[T]] if not IsAssignable[p.name, Keys]]]
+
+class Todo:
+    title: str
+    description: str
+    completed: bool
+
+def f(todo: Todo, preview: Pick[Todo, Literal["title", "completed"]], rest: Omit[Todo, Literal["title"]]):
+    reveal_type(preview.title)  # revealed: str
+    preview.description  # error: [unresolved-attribute]
+    reveal_type(rest.description)  # revealed: str
+    rest.title  # error: [unresolved-attribute]
+    also_preview: Pick[Todo, Literal["title"]] = todo
+```
+
+## `Partial`
+
+[//]: # (playground: slug=partial, phase=2, ts="Partial<T>")
+
+Rebuilding each attribute with `Member[p.name, p.type | None, p.quals]` makes every attribute
+optional. Unlike in TypeScript, `Todo` is not assignable to `Partial[Todo]`: protocol attributes are
+mutable, so their types must match exactly.
+
+```toml
+[environment]
+python-version = "3.14"
+```
+
+```py
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ty_extensions import Attrs, Iter, Member, NewProtocol
+
+type Partial[T] = NewProtocol[*[Member[p.name, p.type | None, p.quals] for p in Iter[Attrs[T]]]]
+
+class Todo:
+    title: str
+    completed: bool
+
+def f(todo: Todo, patch: Partial[Todo]):
+    reveal_type(patch.title)  # revealed: str | None
+    reveal_type(patch.completed)  # revealed: bool | None
+    wrong: Partial[Todo] = todo  # error: [invalid-assignment]
+```
+
+## `Exclude` and `Extract`
+
+[//]: # (playground: slug=exclude-extract, phase=2, ts="Exclude<T, U> / Extract<T, U>")
+
+`FromUnion[T]` turns a union into a tuple, so its elements can be filtered and joined back with
+`Union[*...]`. Note that ty simplifies `int | bool` to `int` before `FromUnion` sees it.
+
+```toml
+[environment]
+python-version = "3.14"
+```
+
+```py
+from typing import TYPE_CHECKING, Literal, Union
+
+if TYPE_CHECKING:
+    from ty_extensions import FromUnion, IsAssignable, Iter
+
+type Exclude[T, U] = Union[*[x for x in Iter[FromUnion[T]] if not IsAssignable[x, U]]]
+type Extract[T, U] = Union[*[x for x in Iter[FromUnion[T]] if IsAssignable[x, U]]]
+
+def f(
+    a: Exclude[str | int | bytes, int],
+    b: Extract[str | int | bytes, int],
+    c: Exclude[Literal["a", "b", "c"], Literal["a"]],
+):
+    reveal_type(a)  # revealed: str | bytes
+    reveal_type(b)  # revealed: int
+    reveal_type(c)  # revealed: Literal["b", "c"]
+```
+
+## Building a `TypedDict`
+
+[//]: # (playground: slug=new-typed-dict, phase=2, ts="{ -readonly [K in keyof T]?: T[K] }")
+
+`NewTypedDict[*members]` creates a `TypedDict`. A `NotRequired` qualifier makes a key optional, so
+`PartialTD` turns every key of a `TypedDict` into an optional one. Dict literals are checked
+against the result.
+
+```toml
+[environment]
+python-version = "3.14"
+```
+
+```py
+from typing import TYPE_CHECKING, Literal, TypedDict
+
+if TYPE_CHECKING:
+    from ty_extensions import Attrs, Iter, Member, NewTypedDict
+
+type PartialTD[T] = NewTypedDict[
+    *[Member[p.name, p.type, p.quals | Literal["NotRequired"]] for p in Iter[Attrs[T]]]
+]
+
+class Movie(TypedDict):
+    title: str
+    year: int
+
+patch: PartialTD[Movie] = {"year": 1979}
+empty: PartialTD[Movie] = {}
+bad: PartialTD[Movie] = {"year": "1979"}  # error: [invalid-argument-type]
+full: Movie = {"year": 1979}  # error: [missing-typed-dict-key]
+```
+
+## Properties only
+
+[//]: # (playground: slug=props-only, phase=2, ts="{ [K in keyof T as T[K] extends Property<any> ? K : never]: T[K]['value'] }")
+
+A variant of the PEP's Prisma-style `PropsOnly`: keep only the attributes whose type is a
+`Property[...]`, and unwrap them with `GetMemberType` (the PEP's version uses `GetArg`, which comes
+in phase 3).
+
+```toml
+[environment]
+python-version = "3.14"
+```
+
+```py
+from typing import TYPE_CHECKING, Any, Literal
+
+if TYPE_CHECKING:
+    from ty_extensions import Attrs, GetMemberType, IsAssignable, Iter, Member, NewProtocol
+
+class Property[T]:
+    value: T
+
+class Link: ...
+
+class User:
+    name: Property[str]
+    age: Property[int]
+    posts: Link
+
+type PropsOnly[T] = NewProtocol[
+    *[Member[p.name, GetMemberType[p.type, Literal["value"]]] for p in Iter[Attrs[T]] if IsAssignable[p.type, Property[Any]]]
+]
+
+def f(props: PropsOnly[User]):
+    reveal_type(props.name)  # revealed: str
+    reveal_type(props.age)  # revealed: int
+    props.posts  # error: [unresolved-attribute]
+```

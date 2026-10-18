@@ -143,6 +143,8 @@ pub enum KnownClass {
     // _typeshed._type_checker_internals
     NamedTupleFallback,
     NamedTupleLike,
+    // ty_extensions (PEP 827)
+    TyExtensionsMember,
     TypedDictFallback,
     // string.templatelib
     Template,
@@ -275,6 +277,7 @@ impl KnownClass {
             | Self::KwOnly
             | Self::NamedTupleFallback
             | Self::NamedTupleLike
+            | Self::TyExtensionsMember
             | Self::TypedDictFallback
             | Self::Template
             | Self::Path
@@ -415,6 +418,7 @@ impl KnownClass {
             | Self::KwOnly
             | Self::NamedTupleFallback
             | Self::NamedTupleLike
+            | Self::TyExtensionsMember
             | Self::ConstraintSet
             | Self::ConstraintSetSolution
             | Self::GenericContext
@@ -540,6 +544,7 @@ impl KnownClass {
             | KnownClass::KwOnly
             | KnownClass::NamedTupleFallback
             | KnownClass::NamedTupleLike
+            | KnownClass::TyExtensionsMember
             | KnownClass::ConstraintSet
             | KnownClass::ConstraintSetSolution
             | KnownClass::GenericContext
@@ -659,6 +664,7 @@ impl KnownClass {
             | KnownClass::KwOnly
             | KnownClass::NamedTupleFallback
             | KnownClass::NamedTupleLike
+            | KnownClass::TyExtensionsMember
             | KnownClass::ConstraintSet
             | KnownClass::ConstraintSetSolution
             | KnownClass::GenericContext
@@ -779,6 +785,7 @@ impl KnownClass {
             | KnownClass::TypedDictFallback
             | KnownClass::ExtensionTypedDictFallback
             | KnownClass::NamedTupleLike
+            | KnownClass::TyExtensionsMember
             | KnownClass::NamedTupleFallback
             | KnownClass::ConstraintSet
             | KnownClass::ConstraintSetSolution
@@ -906,6 +913,7 @@ impl KnownClass {
             | Self::Field
             | Self::KwOnly
             | Self::NamedTupleFallback
+            | Self::TyExtensionsMember
             | Self::ConstraintSet
             | Self::ConstraintSetSolution
             | Self::GenericContext
@@ -1033,6 +1041,7 @@ impl KnownClass {
             | KnownClass::Field
             | KnownClass::KwOnly
             | KnownClass::NamedTupleLike
+            | KnownClass::TyExtensionsMember
             | KnownClass::Template
             | KnownClass::Path
             | KnownClass::FunctoolsPartial
@@ -1162,6 +1171,7 @@ impl KnownClass {
             Self::KwOnly => "KW_ONLY",
             Self::NamedTupleFallback => "NamedTupleFallback",
             Self::NamedTupleLike => "NamedTupleLike",
+            Self::TyExtensionsMember => "Member",
             Self::ConstraintSet => "ConstraintSet",
             Self::ConstraintSetSolution => "ConstraintSetSolution",
             Self::GenericContext => "GenericContext",
@@ -1597,7 +1607,7 @@ impl KnownClass {
             | Self::OrderedDict => KnownModule::Collections,
             Self::Field | Self::KwOnly => KnownModule::Dataclasses,
             Self::NamedTupleFallback | Self::TypedDictFallback => KnownModule::TypeCheckerInternals,
-            Self::NamedTupleLike => KnownModule::TyExtensions,
+            Self::NamedTupleLike | Self::TyExtensionsMember => KnownModule::TyExtensions,
             Self::ConstraintSet
             | Self::ConstraintSetSolution
             | Self::GenericContext
@@ -1720,6 +1730,7 @@ impl KnownClass {
             | Self::SupportsKeysAndGetItem
             | Self::NamedTupleFallback
             | Self::NamedTupleLike
+            | Self::TyExtensionsMember
             | Self::ConstraintSet
             | Self::ConstraintSetSolution
             | Self::GenericContext
@@ -1840,6 +1851,7 @@ impl KnownClass {
             "KW_ONLY" => &[Self::KwOnly],
             "NamedTupleFallback" => &[Self::NamedTupleFallback],
             "NamedTupleLike" => &[Self::NamedTupleLike],
+            "Member" => &[Self::TyExtensionsMember],
             "ConstraintSet" => &[Self::ConstraintSet],
             "ConstraintSetSolution" => &[Self::ConstraintSetSolution],
             "GenericContext" => &[Self::GenericContext],
@@ -1946,6 +1958,7 @@ impl KnownClass {
             | Self::ExtensionsTypeAliasType
             | Self::Sentinel
             | Self::NamedTupleLike
+            | Self::TyExtensionsMember
             | Self::ConstraintSet
             | Self::ConstraintSetSolution
             | Self::GenericContext

@@ -3496,7 +3496,6 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             && (matches!(
                 expr,
                 ast::Expr::Lambda(_)
-                    | ast::Expr::ListComp(_)
                     | ast::Expr::SetComp(_)
                     | ast::Expr::DictComp(_)
                     | ast::Expr::Generator(_)
@@ -3504,8 +3503,9 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                 .value_expressions_in_type_expression
                 .remove(&ExpressionNodeKey::from(expr)))
         {
-            // Nested scopes and `Annotated` metadata are value expressions, not type
-            // expressions; don't leak the flag into them.
+            // Nested scopes (other than PEP 827 type-level list comprehensions, handled below)
+            // and `Annotated` metadata are value expressions, not type expressions; don't leak
+            // the flag into them.
             self.in_type_expression = false;
             self.visit_expr_with_context(expr, context);
             self.in_type_expression = true;
@@ -3529,6 +3529,30 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                 {
                     // PEP 827 type-level `and`/`or`/`not`: no runtime control flow to model.
                     walk_expr(self, expr);
+                    return;
+                }
+                ast::Expr::ListComp(ast::ExprListComp {
+                    elt, generators, ..
+                }) => {
+                    // PEP 827 type-level comprehension (`*[T for x in Iter[...]]`): evaluated
+                    // entirely by type inference in the enclosing scope. Don't create a
+                    // comprehension scope and don't bind the targets; the loop variables are
+                    // resolved by inference before any place lookup, so their uses here only
+                    // leave used-but-unbound symbols in the current scope (which never count
+                    // as members or public symbols). The targets are still mapped to the current
+                    // scope (without any binding) so that expression-scope lookups on them
+                    // succeed. Later `for` clauses are rejected by inference but still walked so
+                    // that every sub-expression is indexed.
+                    let scope = self.current_scope();
+                    for generator in generators {
+                        self.scopes_by_expression
+                            .record_expression_tree(&generator.target, scope);
+                        self.visit_expr(&generator.iter);
+                        for if_expr in &generator.ifs {
+                            self.visit_expr(if_expr);
+                        }
+                    }
+                    self.visit_expr(elt);
                     return;
                 }
                 ast::Expr::Subscript(ast::ExprSubscript { value, slice, .. })
@@ -6277,6 +6301,23 @@ impl ExpressionsScopeMapBuilder {
     fn record_expression(&mut self, expression: &impl HasTrackedScope, scope: FileScopeId) {
         self.expression_and_scope
             .push((expression.node_index().load(), scope));
+    }
+
+    /// Records `expression` and all of its sub-expressions as belonging to `scope`.
+    fn record_expression_tree(&mut self, expression: &ast::Expr, scope: FileScopeId) {
+        struct Recorder<'a> {
+            map: &'a mut ExpressionsScopeMapBuilder,
+            scope: FileScopeId,
+        }
+
+        impl<'ast> Visitor<'ast> for Recorder<'_> {
+            fn visit_expr(&mut self, expr: &'ast ast::Expr) {
+                self.map.record_expression(expr, self.scope);
+                walk_expr(self, expr);
+            }
+        }
+
+        Recorder { map: self, scope }.visit_expr(expression);
     }
 
     fn build(mut self) -> ExpressionsScopeMap {

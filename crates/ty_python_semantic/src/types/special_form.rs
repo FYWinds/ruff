@@ -96,6 +96,22 @@ pub enum SpecialFormType {
     IsEquivalent,
     /// The symbol `ty_extensions.Bool` (PEP 827 type boolean)
     Bool,
+    /// The symbol `ty_extensions.Iter` (PEP 827 comprehension iterable)
+    Iter,
+    /// The symbol `ty_extensions.Attrs` (PEP 827 member introspection)
+    Attrs,
+    /// The symbol `ty_extensions.Members` (PEP 827 member introspection)
+    Members,
+    /// The symbol `ty_extensions.GetMember` (PEP 827 member introspection)
+    GetMember,
+    /// The symbol `ty_extensions.GetMemberType` (PEP 827 member introspection)
+    GetMemberType,
+    /// The symbol `ty_extensions.NewProtocol` (PEP 827 structural synthesis)
+    NewProtocol,
+    /// The symbol `ty_extensions.NewTypedDict` (PEP 827 structural synthesis)
+    NewTypedDict,
+    /// The symbol `ty_extensions.FromUnion` (PEP 827 union decomposition)
+    FromUnion,
     /// The symbol `ty_extensions._internal.TypeOf`
     TypeOf,
     /// The symbol `ty_extensions._internal.CallableTypeOf`
@@ -171,6 +187,14 @@ impl SpecialFormType {
             | Self::IsAssignable
             | Self::IsEquivalent
             | Self::Bool
+            | Self::Iter
+            | Self::Attrs
+            | Self::Members
+            | Self::GetMember
+            | Self::GetMemberType
+            | Self::NewProtocol
+            | Self::NewTypedDict
+            | Self::FromUnion
             | Self::CallableTypeOf
             | Self::RegularCallableTypeOf
             | Self::Unknown
@@ -327,6 +351,14 @@ impl SpecialFormType {
             IsAssignable,
             IsEquivalent,
             Bool,
+            Iter,
+            Attrs,
+            Members,
+            GetMember,
+            GetMemberType,
+            NewProtocol,
+            NewTypedDict,
+            FromUnion,
             TypeOf,
             CallableTypeOf,
             RegularCallableTypeOf,
@@ -378,6 +410,14 @@ impl SpecialFormType {
                     SpecialFormType::IsAssignable => Self::IsAssignable,
                     SpecialFormType::IsEquivalent => Self::IsEquivalent,
                     SpecialFormType::Bool => Self::Bool,
+                    SpecialFormType::Iter => Self::Iter,
+                    SpecialFormType::Attrs => Self::Attrs,
+                    SpecialFormType::Members => Self::Members,
+                    SpecialFormType::GetMember => Self::GetMember,
+                    SpecialFormType::GetMemberType => Self::GetMemberType,
+                    SpecialFormType::NewProtocol => Self::NewProtocol,
+                    SpecialFormType::NewTypedDict => Self::NewTypedDict,
+                    SpecialFormType::FromUnion => Self::FromUnion,
                     SpecialFormType::Literal => Self::Literal,
                     SpecialFormType::LiteralString => Self::LiteralString,
                     SpecialFormType::Never => Self::Never,
@@ -442,6 +482,14 @@ impl SpecialFormType {
                     SpecialFormTypeBuilder::IsAssignable => &[Self::IsAssignable],
                     SpecialFormTypeBuilder::IsEquivalent => &[Self::IsEquivalent],
                     SpecialFormTypeBuilder::Bool => &[Self::Bool],
+                    SpecialFormTypeBuilder::Iter => &[Self::Iter],
+                    SpecialFormTypeBuilder::Attrs => &[Self::Attrs],
+                    SpecialFormTypeBuilder::Members => &[Self::Members],
+                    SpecialFormTypeBuilder::GetMember => &[Self::GetMember],
+                    SpecialFormTypeBuilder::GetMemberType => &[Self::GetMemberType],
+                    SpecialFormTypeBuilder::NewProtocol => &[Self::NewProtocol],
+                    SpecialFormTypeBuilder::NewTypedDict => &[Self::NewTypedDict],
+                    SpecialFormTypeBuilder::FromUnion => &[Self::FromUnion],
                     SpecialFormTypeBuilder::Literal => &[Self::Literal],
                     SpecialFormTypeBuilder::LiteralString => &[Self::LiteralString],
                     SpecialFormTypeBuilder::Never => &[Self::Never],
@@ -561,7 +609,15 @@ impl SpecialFormType {
             | Self::Intersection
             | Self::IsAssignable
             | Self::IsEquivalent
-            | Self::Bool => module.is_ty_extensions(),
+            | Self::Bool
+            | Self::Iter
+            | Self::Attrs
+            | Self::Members
+            | Self::GetMember
+            | Self::GetMemberType
+            | Self::NewProtocol
+            | Self::NewTypedDict
+            | Self::FromUnion => module.is_ty_extensions(),
 
             Self::Unknown
             | Self::Divergent
@@ -640,6 +696,14 @@ impl SpecialFormType {
             | Self::IsAssignable
             | Self::IsEquivalent
             | Self::Bool
+            | Self::Iter
+            | Self::Attrs
+            | Self::Members
+            | Self::GetMember
+            | Self::GetMemberType
+            | Self::NewProtocol
+            | Self::NewTypedDict
+            | Self::FromUnion
             | Self::TypeOf
             | Self::CallableTypeOf
             | Self::RegularCallableTypeOf
@@ -682,6 +746,14 @@ impl SpecialFormType {
             | Self::IsAssignable
             | Self::IsEquivalent
             | Self::Bool
+            | Self::Iter
+            | Self::Attrs
+            | Self::Members
+            | Self::GetMember
+            | Self::GetMemberType
+            | Self::NewProtocol
+            | Self::NewTypedDict
+            | Self::FromUnion
             | Self::Literal
             | Self::LiteralString
             | Self::Never
@@ -750,6 +822,14 @@ impl SpecialFormType {
             SpecialFormType::IsAssignable => "IsAssignable",
             SpecialFormType::IsEquivalent => "IsEquivalent",
             SpecialFormType::Bool => "Bool",
+            SpecialFormType::Iter => "Iter",
+            SpecialFormType::Attrs => "Attrs",
+            SpecialFormType::Members => "Members",
+            SpecialFormType::GetMember => "GetMember",
+            SpecialFormType::GetMemberType => "GetMemberType",
+            SpecialFormType::NewProtocol => "NewProtocol",
+            SpecialFormType::NewTypedDict => "NewTypedDict",
+            SpecialFormType::FromUnion => "FromUnion",
             SpecialFormType::TypeOf => "TypeOf",
             SpecialFormType::CallableTypeOf => "CallableTypeOf",
             SpecialFormType::RegularCallableTypeOf => "RegularCallableTypeOf",
@@ -805,6 +885,14 @@ impl SpecialFormType {
             | SpecialFormType::IsAssignable
             | SpecialFormType::IsEquivalent
             | SpecialFormType::Bool
+            | SpecialFormType::Iter
+            | SpecialFormType::Attrs
+            | SpecialFormType::Members
+            | SpecialFormType::GetMember
+            | SpecialFormType::GetMemberType
+            | SpecialFormType::NewProtocol
+            | SpecialFormType::NewTypedDict
+            | SpecialFormType::FromUnion
             | SpecialFormType::Top
             | SpecialFormType::Bottom => &[KnownModule::TyExtensions],
 
@@ -945,9 +1033,11 @@ impl SpecialFormType {
             Self::TypeAlias => Err(InvalidTypeExpression::TypeAlias),
             Self::TypedDict(_) => Err(InvalidTypeExpression::TypedDict),
 
-            Self::Literal | Self::Union | Self::Intersection => {
-                Err(InvalidTypeExpression::RequiresArguments(self))
-            }
+            Self::Literal
+            | Self::Union
+            | Self::Intersection
+            | Self::NewProtocol
+            | Self::NewTypedDict => Err(InvalidTypeExpression::RequiresArguments(self)),
 
             Self::Protocol => Err(InvalidTypeExpression::Protocol),
             Self::Generic => Err(InvalidTypeExpression::Generic),
@@ -959,13 +1049,20 @@ impl SpecialFormType {
                 Err(InvalidTypeExpression::Concatenate)
             }
 
-            Self::Concatenate | Self::Annotated | Self::IsAssignable | Self::IsEquivalent => {
-                Err(InvalidTypeExpression::RequiresTwoArguments(self))
-            }
+            Self::Concatenate
+            | Self::Annotated
+            | Self::IsAssignable
+            | Self::IsEquivalent
+            | Self::GetMember
+            | Self::GetMemberType => Err(InvalidTypeExpression::RequiresTwoArguments(self)),
 
             Self::Optional
             | Self::Not
             | Self::Bool
+            | Self::Iter
+            | Self::Attrs
+            | Self::Members
+            | Self::FromUnion
             | Self::Top
             | Self::Bottom
             | Self::TypeOf

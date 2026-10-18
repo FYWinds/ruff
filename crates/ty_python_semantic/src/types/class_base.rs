@@ -307,6 +307,14 @@ impl<'db> ClassBase<'db> {
                 | SpecialFormType::IsAssignable
                 | SpecialFormType::IsEquivalent
                 | SpecialFormType::Bool
+                | SpecialFormType::Iter
+                | SpecialFormType::Attrs
+                | SpecialFormType::Members
+                | SpecialFormType::GetMember
+                | SpecialFormType::GetMemberType
+                | SpecialFormType::NewProtocol
+                | SpecialFormType::NewTypedDict
+                | SpecialFormType::FromUnion
                 | SpecialFormType::TypeOf
                 | SpecialFormType::CallableTypeOf
                 | SpecialFormType::RegularCallableTypeOf

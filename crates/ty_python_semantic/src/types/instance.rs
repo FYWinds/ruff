@@ -190,6 +190,27 @@ impl<'db> Type<'db> {
         ))
     }
 
+    /// Synthesize a protocol instance type from PEP 827 `Member` descriptions; see
+    /// [`ProtocolInterface::from_members`].
+    pub(super) fn protocol_from_members<M>(
+        db: &'db dyn Db,
+        program: crate::Program<'db>,
+        members: M,
+    ) -> Self
+    where
+        M: IntoIterator<
+            Item = (
+                ruff_python_ast::name::Name,
+                Type<'db>,
+                crate::types::TypeQualifiers,
+            ),
+        >,
+    {
+        Self::ProtocolInstance(ProtocolInstanceType::synthesized(
+            SynthesizedProtocolType::new(ProtocolInterface::from_members(db, program, members)),
+        ))
+    }
+
     /// Return the constructed type used in meta-protocol matching and inference.
     ///
     /// There are no constructor arguments here from which to infer the class's type arguments.

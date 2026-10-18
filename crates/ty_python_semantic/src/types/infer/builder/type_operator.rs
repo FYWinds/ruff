@@ -38,7 +38,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
     /// inferred as a type expression at all (it is inferred as an ordinary value expression, like
     /// other invalid type-expression syntax), so that a single diagnostic is reported by the
     /// caller instead of follow-up type-expression diagnostics for the operand.
-    fn infer_type_bool_condition(&mut self, operand: &ast::Expr) -> Option<Type<'db>> {
+    pub(super) fn infer_type_bool_condition(&mut self, operand: &ast::Expr) -> Option<Type<'db>> {
         let speculative = self
             .speculate_without_diagnostics()
             .infer_type_expression(operand);

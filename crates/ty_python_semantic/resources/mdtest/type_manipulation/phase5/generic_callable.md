@@ -1,4 +1,4 @@
-# Generic callables (phase 5 smoke tests)
+# Generic callables
 
 `GenericCallable[Vs, lambda <vs>: Ty]` from [PEP 827] is a callable with its own type variables, like
 the type of a generic function. `Vs` is a tuple of type variables, which only provides their bounds,
@@ -131,6 +131,9 @@ def _(p: Doubler):
 
 ## Generic methods from `Members`
 
+The `.type` of a generic method is already a generic callable, so copying the members of a class
+keeps its generic methods. This does not involve `GenericCallable`, and is not restricted.
+
 ```py
 from ty_extensions import Iter, Members, NewProtocol
 
@@ -210,6 +213,9 @@ def _(
 
 ## Invalid forms
 
+`Vs` must be a tuple of type variables, the second argument must be a lambda with one parameter per
+type variable, and its body must be a callable type.
+
 ```py
 from typing import Callable, Literal, TypeVar
 from ty_extensions import GenericCallable, Member
@@ -275,6 +281,11 @@ def _(p: "NewProtocol[Member[Literal['f'], GenericCallable[tuple[T], lambda T: C
 ```
 
 ## Value-indexed positions
+
+Like type comprehensions (phase 2), the lambda of a `GenericCallable` is only supported in
+annotations, `type` statements and string annotations. In positions that are indexed as value
+expressions, such as implicit type aliases and `cast`, the lambda has its own scope, so it is
+rejected before any name in it is looked up.
 
 ```py
 from typing import Callable, Literal, TypeAlias, TypeVar, cast

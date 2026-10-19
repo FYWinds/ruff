@@ -201,9 +201,7 @@ def _(b: GetAnnotations[TypeOf[S]]):
     reveal_type(b)  # revealed: Never
 ```
 
-[PEP 827]: https://peps.python.org/pep-0827/
-
-## Smoke: utility types over classes with `Annotated` attributes
+## utility types over classes with `Annotated` attributes
 
 `Pick` / `Omit` / `Partial` still evaluate eagerly: the metadata never reaches the synthesized
 protocol.
@@ -236,7 +234,7 @@ def _(
     reveal_type(as_dict["name"])  # revealed: str
 ```
 
-## Smoke: generic classes and deferred reads
+## generic classes and deferred reads
 
 ```py
 from typing import Annotated, Literal
@@ -270,7 +268,7 @@ def f[C](x: ItemMeta[C], y: GetAnnotations[GetMember[C, Literal["item"]].type]):
     reveal_type(y)  # revealed: GetAnnotations[GetMember[C@f, Literal["item"]].type]
 ```
 
-## Smoke: value-level access to the member type
+## value-level access to the member type
 
 The `type` property of a `Member` value gives the plain type.
 
@@ -288,7 +286,7 @@ def _(attrs: Attrs[Hero]):
         reveal_type(t)  # revealed: int
 ```
 
-## Smoke: invalid uses
+## invalid uses
 
 ```py
 from typing import Annotated
@@ -300,3 +298,5 @@ def _(b: GetAnnotations[Annotated[int, "x"]] | None, c: DropAnnotations["Annotat
     reveal_type(b)  # revealed: Literal["x"] | None
     reveal_type(c)  # revealed: bytes
 ```
+
+[PEP 827]: https://peps.python.org/pep-0827/

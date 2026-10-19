@@ -1108,3 +1108,875 @@ def f(a: SnakeToCamel[Literal["user_name"]], b: SnakeToCamel[Literal["created_at
     reveal_type(a)  # revealed: Literal["userName"]
     reveal_type(b)  # revealed: Literal["createdAtUtc"]
 ```
+
+## Extended callables
+
+[//]: # (playground: slug=extended-callable, phase=5, ts="[a: number, b?: string] as a labeled rest tuple")
+
+`Callable[Params[...], R]` describes any signature, one `Param[name, type, kind, default]` per
+parameter. Unlike `Callable[[...], R]`, it can express names, keyword-only parameters and defaults.
+The result is an ordinary callable type.
+
+```toml
+[environment]
+python-version = "3.14"
+```
+
+```py
+from typing import TYPE_CHECKING, Callable, Literal
+
+if TYPE_CHECKING:
+    from ty_extensions import Param, ParamKind, Params
+
+type Handler = Callable[
+    Params[
+        Param[None, bytes],
+        Param[Literal["retries"], int, Literal[ParamKind.KEYWORD_ONLY], Literal[3]],
+        Param[None, str, Literal[ParamKind.VAR_KEYWORD]],
+    ],
+    bool,
+]
+
+def run(handler: Handler):
+    reveal_type(handler)  # revealed: (bytes, /, *, retries: int = 3, **kwargs: str) -> bool
+    handler(b"data", retries=1, user="me")
+    handler(b"data", retries="many")  # error: [invalid-argument-type]
+```
+
+## Inspecting parameters
+
+[//]: # (playground: slug=callable-params, phase=5, ts="Parameters<typeof f> / ReturnType<typeof f>")
+
+`GetArg[F, Callable, Literal[0]]` is the parameter list of any callable as a `Params[...]`, and
+`GetArgs[P, Params]` turns it into a tuple that a comprehension can iterate over. Here we list the
+names of the parameters that can be passed by keyword.
+
+```toml
+[environment]
+python-version = "3.14"
+```
+
+```py
+from typing import TYPE_CHECKING, Callable, Literal, Union
+
+if TYPE_CHECKING:
+    from ty_extensions import GetArg, GetArgs, IsAssignable, Iter, ParamKind, Params
+
+type ParamsOf[F] = GetArgs[GetArg[F, Callable, Literal[0]], Params]
+type Keyword = Literal[ParamKind.POSITIONAL_OR_KEYWORD, ParamKind.KEYWORD_ONLY]
+type KeywordNames[F] = Union[*[p.name for p in Iter[ParamsOf[F]] if IsAssignable[p.kind, Keyword]]]
+type ReturnOf[F] = GetArg[F, Callable, Literal[1]]
+
+def keyword_names[F](f: F) -> KeywordNames[F]:
+    raise NotImplementedError
+
+def returns[F](f: F) -> ReturnOf[F]:
+    raise NotImplementedError
+
+def connect(host: str, /, port: int = 80, *, timeout: float = 1.0) -> bytes:
+    return b""
+
+def demo():
+    reveal_type(keyword_names(connect))  # revealed: Literal["port", "timeout"]
+    reveal_type(returns(connect))  # revealed: bytes
+```
+
+## Decorators that add a keyword parameter
+
+[//]: # (playground: slug=decorator-add-keyword, phase=5, ts="Parameters<F> plus an options object, ReturnType<F>")
+
+`ParamSpec` cannot add a keyword parameter to an arbitrary function. With extended callables, a
+decorator can copy the parameters of the function and append a keyword-only `timeout`.
+
+```toml
+[environment]
+python-version = "3.14"
+```
+
+```py
+from typing import TYPE_CHECKING, Callable, Literal, cast
+
+if TYPE_CHECKING:
+    from ty_extensions import GetArg, GetArgs, Param, ParamKind, Params
+
+type ParamsOf[F] = GetArgs[GetArg[F, Callable, Literal[0]], Params]
+type Timeout = Param[Literal["timeout"], float, Literal[ParamKind.KEYWORD_ONLY], float]
+type WithTimeout[F] = Callable[Params[*ParamsOf[F], Timeout], GetArg[F, Callable, Literal[1]]]
+
+def with_timeout[F](f: F) -> WithTimeout[F]:
+    return cast(WithTimeout[F], f)
+
+@with_timeout
+def fetch(url: str, retries: int = 0) -> bytes:
+    return b""
+
+def demo():
+    reveal_type(fetch)  # revealed: (url: str, retries: int = 0, *, timeout: float = ...) -> bytes
+    fetch("https://example.com", timeout=2.5)
+    fetch("https://example.com", timeout="soon")  # error: [invalid-argument-type]
+```
+
+## Inferring a TypedDict from `**kwargs`
+
+[//]: # (playground: slug=kwargs-typed-dict, phase=5, ts="function select<const K extends Fields>")
+
+With `**kwargs: Unpack[K]`, the keyword arguments of a call are collected into a `TypedDict` that
+keeps their literal types. A query function can use it to compute its result type from the columns
+that were asked for.
+
+```toml
+[environment]
+python-version = "3.14"
+```
+
+```py
+from typing import TYPE_CHECKING, Unpack
+
+if TYPE_CHECKING:
+    from ty_extensions import Attrs, BaseTypedDict, GetMemberType, Iter, Member, NewProtocol
+
+type Selected[M, K] = NewProtocol[*[Member[c.name, GetMemberType[M, c.name]] for c in Iter[Attrs[K]]]]
+
+def select[M, K: BaseTypedDict](model: type[M], /, **columns: Unpack[K]) -> list[Selected[M, K]]:
+    raise NotImplementedError
+
+class User:
+    id: int
+    name: str
+    email: str | None
+
+def demo():
+    rows = select(User, name=True, email=True)
+    reveal_type(rows[0].name)  # revealed: str
+    reveal_type(rows[0].email)  # revealed: str | None
+    rows[0].id  # error: [unresolved-attribute]
+```
+
+## Field descriptors
+
+[//]: # (playground: slug=init-field, phase=5, ts="{ default: 0, primaryKey: true } as const")
+
+Subclasses of `InitField` describe fields like `dataclasses.field` or SQLModel's `Field`. Calling
+one infers the literal types of its keyword arguments, and the result becomes the `init` of the
+attribute's `Member`, so type-level code can read how each field was declared.
+
+```toml
+[environment]
+python-version = "3.14"
+```
+
+```py
+from typing import TYPE_CHECKING, Literal, ReadOnly, TypedDict, Union
+
+if TYPE_CHECKING:
+    from ty_extensions import Attrs, GetArg, GetMemberType, InitField, IsAssignable, Iter
+
+class FieldArgs(TypedDict, total=False):
+    default: ReadOnly[object]
+    primary_key: ReadOnly[bool]
+
+if TYPE_CHECKING:
+    class Field[T: FieldArgs](InitField[T]): ...
+else:
+    def Field(**kwargs):
+        return None
+
+type Item[I, K] = GetMemberType[GetArg[I, InitField, Literal[0]], K]
+type PrimaryKey[T] = Union[*[p.name for p in Iter[Attrs[T]] if IsAssignable[Literal[True], Item[p.init, Literal["primary_key"]]]]]
+
+class Hero:
+    id: int | None = Field(default=None, primary_key=True)
+    name: str = Field()
+
+def demo(hero: Hero, key: PrimaryKey[Hero]):
+    reveal_type(key)  # revealed: Literal["id"]
+    reveal_type(hero.id)  # revealed: int | None
+```
+
+## Dataclass-style `__init__`
+
+[//]: # (playground: slug=dataclass-update-class, phase=5, ts="constructor taking { [K in keyof T]: T[K] }")
+
+A class decorator whose return type is `UpdateClass[...]` adds members to the decorated class. This
+one generates a keyword-only `__init__` from the attributes, like `@dataclass(kw_only=True)`, but
+written in a library instead of being built into the type checker.
+
+```toml
+[environment]
+python-version = "3.14"
+```
+
+```py
+from typing import TYPE_CHECKING, Callable, Literal
+
+if TYPE_CHECKING:
+    from ty_extensions import Attrs, Iter, Member, Param, ParamKind, Params, UpdateClass
+
+type KwParams[T] = tuple[*[Param[p.name, p.type, Literal[ParamKind.KEYWORD_ONLY], p.init] for p in Iter[Attrs[T]]]]
+type InitFn[T] = Callable[Params[Param[Literal["self"], T], *KwParams[T]], None]
+
+def dataclass_ish[T](cls: type[T]) -> UpdateClass[Member[Literal["__init__"], InitFn[T], Literal["ClassVar"]]]:
+    return cls
+
+@dataclass_ish
+class Point:
+    x: int
+    y: int = 0
+
+def demo():
+    reveal_type(Point.__init__)  # revealed: (self: Point, *, x: int, y: int = 0) -> None
+    Point(x=1)
+    Point(1, x=1)  # error: [too-many-positional-arguments]
+    Point(y=2)  # error: [missing-argument]
+```
+
+## Base classes that update their subclasses
+
+[//]: # (playground: slug=model-init-subclass, phase=5, ts="class Hero extends Model<Hero>")
+
+`__init_subclass__` can return `UpdateClass[...]` too. Then every subclass is updated when it is
+defined, like a Pydantic model: `Hero` and `Sidekick` get an `__init__` without a decorator.
+
+```toml
+[environment]
+python-version = "3.14"
+```
+
+```py
+from typing import TYPE_CHECKING, Callable, Literal
+
+if TYPE_CHECKING:
+    from ty_extensions import Attrs, Iter, Member, Param, ParamKind, Params, UpdateClass
+
+type KwParams[T] = tuple[*[Param[p.name, p.type, Literal[ParamKind.KEYWORD_ONLY], p.init] for p in Iter[Attrs[T]]]]
+type InitFn[T] = Callable[Params[Param[Literal["self"], T], *KwParams[T]], None]
+
+class Model:
+    def __init_subclass__[T](cls: type[T]) -> UpdateClass[Member[Literal["__init__"], InitFn[T], Literal["ClassVar"]]]:
+        pass
+
+class Hero(Model):
+    name: str
+    age: int | None = None
+
+class Sidekick(Hero):
+    power: str
+
+def demo():
+    reveal_type(Sidekick.__init__)  # revealed: (self: Sidekick, *, name: str, age: int | None = None, power: str) -> None
+    Hero(name="Deadpond")
+    Hero(name="Deadpond", power="none")  # error: [unknown-argument]
+```
+
+## FastAPI CRUD models
+
+[//]: # (playground: slug=fastapi-initfield-crud, phase=5, ts="Omit<Hero, 'secret_name'> / Omit<Hero, 'id'> / Partial<...>")
+
+The motivating example of PEP 827: from one `Hero` model, derive the models that a FastAPI endpoint
+returns (`Public`: no hidden fields, primary key not optional), accepts for creation (`Create`: no
+primary key) and accepts for updates (`Update`: like `Create`, but everything optional). The field
+helpers live in `fields.py`.
+
+```toml
+[environment]
+python-version = "3.14"
+```
+
+`fields.py`:
+
+```py
+from typing import TYPE_CHECKING, Literal, ReadOnly, TypedDict, Union
+
+if TYPE_CHECKING:
+    from ty_extensions import FromUnion, GetArg, GetMemberType, InitField, IsAssignable, Iter
+
+class FieldArgs(TypedDict, total=False):
+    default: ReadOnly[object]
+    primary_key: ReadOnly[bool]
+    hidden: ReadOnly[bool]
+
+if TYPE_CHECKING:
+    class Field[T: FieldArgs](InitField[T]): ...
+else:
+    def Field(**kwargs):
+        return None
+
+type Item[I, K] = GetMemberType[GetArg[I, InitField, Literal[0]], K]
+type IsSet[I, K] = IsAssignable[Literal[True], Item[I, K]]
+type Default[I] = Item[I, Literal["default"]]
+type NotOptional[T] = Union[*[x for x in Iter[FromUnion[T]] if not IsAssignable[x, None]]]
+```
+
+```py
+from typing import TYPE_CHECKING, Literal
+from fields import Default, Field, IsSet, NotOptional
+
+if TYPE_CHECKING:
+    from ty_extensions import Attrs, Iter, Member, NewProtocol
+
+type PK = Literal["primary_key"]
+type Public[T] = NewProtocol[*[
+    Member[p.name, NotOptional[p.type] if IsSet[p.init, PK] else p.type]
+    for p in Iter[Attrs[T]] if not IsSet[p.init, Literal["hidden"]]
+]]
+type Create[T] = NewProtocol[*[
+    Member[p.name, p.type, p.quals, Default[p.init]] for p in Iter[Attrs[T]] if not IsSet[p.init, PK]
+]]
+type Update[T] = NewProtocol[*[
+    Member[p.name, p.type | None, p.quals, None] for p in Iter[Attrs[T]] if not IsSet[p.init, PK]
+]]
+
+class Hero:
+    id: int | None = Field(default=None, primary_key=True)
+    name: str = Field()
+    age: int | None = Field(default=None)
+    secret_name: str = Field(hidden=True)
+
+def endpoints(public: Public[Hero], create: Create[Hero], update: Update[Hero]):
+    reveal_type(public.id)  # revealed: int
+    reveal_type(create.age)  # revealed: int | None
+    reveal_type(update.name)  # revealed: str | None
+    public.secret_name  # error: [unresolved-attribute]
+    create.id  # error: [unresolved-attribute]
+```
+
+## Prisma-style `select` with nested relations
+
+[//]: # (playground: slug=showcase-orm-select, phase=6, ts="prisma.user.findMany({ select: { name: true, posts: { select: { title: true } } } })")
+
+An ORM query whose result type is computed from the query itself. The keyword arguments of
+`select` are inferred as a `TypedDict` (`**kwargs: Unpack[K]`) that keeps their literal types, so the
+result knows exactly which columns were asked for. `Project` walks over that `TypedDict` with
+`Attrs`, looks up each column on the model with `GetMemberType`, and unwraps `Property[...]` and
+`Link[...]` markers with `GetArg`. A relation selected with `True` gives the scalar properties of the
+target model, and a relation selected with `include(...)` is projected recursively (the two aliases
+refer to each other). `MultiLink` relations become lists, and `all()` plus `RaiseError` reject columns
+that the model does not have.
+
+```toml
+[environment]
+python-version = "3.14"
+```
+
+```py
+from typing import TYPE_CHECKING, Any, Literal, Union, Unpack
+
+if TYPE_CHECKING:
+    from ty_extensions import Attrs, BaseTypedDict, GetArg, GetMemberType, IsAssignable, Iter, Member, NewProtocol, RaiseError
+
+class Pointer[T]: ...
+class Property[T](Pointer[T]): ...
+class Link[T](Pointer[T]): ...
+class MultiLink[T](Link[T]): ...
+class Nested[K]: ...
+
+def include[K: BaseTypedDict](**columns: Unpack[K]) -> Nested[K]:
+    raise NotImplementedError
+
+type Target[F] = GetArg[F, Pointer, Literal[0]]
+type Many[F, R] = list[R] if IsAssignable[F, MultiLink[Any]] else R
+type Scalars[M] = NewProtocol[
+    *[Member[p.name, Target[p.type]] for p in Iter[Attrs[M]] if IsAssignable[p.type, Property[Any]]]
+]
+type Resolve[F, V] = (
+    Target[F]
+    if IsAssignable[F, Property[Any]]
+    else Many[F, Project[Target[F], GetArg[V, Nested, Literal[0]]]]
+    if IsAssignable[V, Nested[Any]]
+    else Many[F, Scalars[Target[F]]]
+)
+type Project[M, K] = NewProtocol[*[Member[c.name, Resolve[GetMemberType[M, c.name], c.type]] for c in Iter[Attrs[K]]]]
+type Columns[M] = Union[*[p.name for p in Iter[Attrs[M]]]]
+type Checked[M, K] = (
+    Project[M, K]
+    if all(IsAssignable[c.name, Columns[M]] for c in Iter[Attrs[K]])
+    else RaiseError[Literal["unknown columns"], Union[*[c.name for c in Iter[Attrs[K]] if not IsAssignable[c.name, Columns[M]]]]]
+)
+
+def select[M, K: BaseTypedDict](model: type[M], /, **columns: Unpack[K]) -> list[Checked[M, K]]:
+    raise NotImplementedError
+
+class Comment:
+    id: Property[int]
+    body: Property[str]
+
+class Post:
+    id: Property[int]
+    title: Property[str]
+    comments: MultiLink[Comment]
+
+class User:
+    id: Property[int]
+    name: Property[str]
+    email: Property[str | None]
+    manager: Link[User]
+    posts: MultiLink[Post]
+
+def demo():
+    users = select(User, name=True, manager=True, posts=include(title=True, comments=True))
+    reveal_type(users[0].name)  # revealed: str
+    reveal_type(users[0].manager.email)  # revealed: str | None
+    users[0].email  # error: [unresolved-attribute]
+    users[0].manager.posts  # error: [unresolved-attribute]
+    reveal_type(users[0].posts[0].title)  # revealed: str
+    reveal_type(users[0].posts[0].comments[0].body)  # revealed: str
+    users[0].posts[0].id  # error: [unresolved-attribute]
+
+def typo():
+    select(User, name=True, emial=True)  # error: [raised-type-error] "unknown columns: Literal["emial"]"
+```
+
+## FastAPI CRUD router
+
+[//]: # (playground: slug=showcase-fastapi-crud, phase=6, ts="createRouter<typeof Hero>(): { create(body: Omit<Hero, 'id'>): Public<Hero> }")
+
+The motivating example of PEP 827, taken one step further: from a single SQLModel-style `Hero`
+class, derive a whole typed CRUD router. The fields are declared with `Field(...)`, an `InitField`
+subclass, so type-level code can read `primary_key`, `hidden` and `default` from each attribute's
+`Member.init`. `Public` (what the API returns) hides the `hidden` fields and makes the primary key
+non-optional by filtering `FromUnion`. `create` and `update` are extended callables built with
+`Params` and a comprehension: `create` takes one keyword-only parameter per non-key column with the
+field's default, and `update` makes every column optional. The field helpers live in `fields.py`.
+
+```toml
+[environment]
+python-version = "3.14"
+```
+
+`fields.py`:
+
+```py
+from typing import TYPE_CHECKING, Literal, ReadOnly, TypedDict, Union
+
+if TYPE_CHECKING:
+    from ty_extensions import FromUnion, GetArg, GetMemberType, InitField, IsAssignable, Iter
+
+class FieldArgs(TypedDict, total=False):
+    default: ReadOnly[object]
+    primary_key: ReadOnly[bool]
+    hidden: ReadOnly[bool]
+
+if TYPE_CHECKING:
+    class Field[T: FieldArgs](InitField[T]): ...
+else:
+    def Field(**kwargs):
+        return None
+
+type Item[I, K] = GetMemberType[GetArg[I, InitField, Literal[0]], K]
+type IsSet[I, K] = IsAssignable[Literal[True], Item[I, K]]
+type Default[I] = Item[I, Literal["default"]]
+type NotOptional[T] = Union[*[x for x in Iter[FromUnion[T]] if not IsAssignable[x, None]]]
+```
+
+```py
+from typing import TYPE_CHECKING, Callable, Literal
+from fields import Default, Field, IsSet, NotOptional
+
+if TYPE_CHECKING:
+    from ty_extensions import Attrs, Iter, Member, NewProtocol, Param, ParamKind, Params
+
+type PK = Literal["primary_key"]
+type KwOnly = Literal[ParamKind.KEYWORD_ONLY]
+type Public[T] = NewProtocol[
+    *[
+        Member[p.name, NotOptional[p.type] if IsSet[p.init, PK] else p.type]
+        for p in Iter[Attrs[T]]
+        if not IsSet[p.init, Literal["hidden"]]
+    ]
+]
+type CreateParams[T] = Params[
+    *[Param[p.name, p.type, KwOnly, Default[p.init]] for p in Iter[Attrs[T]] if not IsSet[p.init, PK]]
+]
+type UpdateParams[T] = Params[
+    Param[None, int],
+    *[Param[p.name, p.type | None, KwOnly, None] for p in Iter[Attrs[T]] if not IsSet[p.init, PK]],
+]
+type ListParams = Params[Param[Literal["offset"], int, KwOnly, Literal[0]], Param[Literal["limit"], int, KwOnly, Literal[100]]]
+type Router[T] = NewProtocol[
+    Member[Literal["create"], Callable[CreateParams[T], Public[T]]],
+    Member[Literal["get"], Callable[[int], Public[T] | None]],
+    Member[Literal["update"], Callable[UpdateParams[T], Public[T]]],
+    Member[Literal["list"], Callable[ListParams, list[Public[T]]]],
+]
+
+def crud[T](model: type[T]) -> Router[T]:
+    raise NotImplementedError
+
+class Hero:
+    id: int | None = Field(default=None, primary_key=True)
+    name: str = Field()
+    age: int | None = Field(default=None)
+    secret_name: str = Field(hidden=True)
+
+def endpoints():
+    heroes = crud(Hero)
+    created = heroes.create(name="Deadpond", secret_name="Dive Wilson")
+    # revealed: (*, name: str, age: int | None = None, secret_name: str) -> Public[Hero]
+    reveal_type(heroes.create)
+    reveal_type(created.id)  # revealed: int
+    reveal_type(heroes.update(1, age=31).age)  # revealed: int | None
+    reveal_type(heroes.list(limit=10)[0].name)  # revealed: str
+    created.secret_name  # error: [unresolved-attribute]
+    heroes.create(name="Deadpond")  # error: [missing-argument]
+    heroes.create(id=1, name="Deadpond", secret_name="Dive Wilson")  # error: [unknown-argument]
+    heroes.update(1, nickname="Wade")  # error: [unknown-argument]
+    heroes.list(10)  # error: [too-many-positional-arguments]
+```
+
+## Observable store
+
+[//]: # (playground: slug=showcase-observable-store, phase=6, ts="{ [K in keyof T as `on${Capitalize<CamelCase<K>>}Change`]: (h: (old: T[K], new: T[K]) => void) => () => void }")
+
+A typed observable store, like a MobX or Vue store. For every public attribute of `Settings`, the
+store has the attribute itself, a `set_x` setter, and an `onXChange` subscription method whose name is
+computed with a recursive snake_case to PascalCase conversion (`Slice`, `Concat`, `Uppercase`).
+Attributes whose name starts with `_` are private, and attributes annotated with `Silent()` metadata
+(read with `GetAnnotations`) do not emit events. `emit` is an `Overloaded` callable with one signature
+per observable attribute, so the value type is checked against the attribute name. Handlers are
+extended callables with named parameters.
+
+```toml
+[environment]
+python-version = "3.14"
+```
+
+```py
+from typing import TYPE_CHECKING, Annotated, Callable, Literal
+
+if TYPE_CHECKING:
+    from ty_extensions import (
+        Attrs, Concat, GetAnnotations, IsAssignable, IsEquivalent, Iter, Member, NewProtocol, Overloaded, Param, Params, Slice, Uppercase,
+    )
+
+class Silent: ...
+
+type Head[S] = Slice[S, Literal[0], Literal[1]]
+type Tail[S] = Slice[S, Literal[1], None]
+type Camel[S] = (
+    S
+    if IsEquivalent[S, Literal[""]]
+    else Concat[Uppercase[Head[Tail[S]]], Camel[Tail[Tail[S]]]]
+    if IsEquivalent[Head[S], Literal["_"]]
+    else Concat[Head[S], Camel[Tail[S]]]
+)
+type Pascal[S] = Concat[Uppercase[Head[S]], Camel[Tail[S]]]
+type IsPublic[P] = not IsEquivalent[Head[P.name], Literal["_"]]
+type Fields[T] = tuple[*[p for p in Iter[Attrs[T]] if IsPublic[p]]]
+type Observed[T] = tuple[*[p for p in Iter[Attrs[T]] if IsPublic[p] and not IsAssignable[Silent, GetAnnotations[p.type]]]]
+
+type Handler[V] = Callable[Params[Param[Literal["old"], V], Param[Literal["new"], V]], None]
+type Store[T] = NewProtocol[
+    *[Member[p.name, p.type] for p in Iter[Fields[T]]],
+    *[Member[Concat[Literal["set_"], p.name], Callable[[p.type], None]] for p in Iter[Fields[T]]],
+    *[Member[Concat[Literal["on"], Concat[Pascal[p.name], Literal["Change"]]], Callable[[Handler[p.type]], Callable[[], None]]] for p in Iter[Observed[T]]],
+    Member[Literal["emit"], Overloaded[*[Callable[Params[Param[Literal["field"], p.name], Param[Literal["value"], p.type]], None] for p in Iter[Observed[T]]]]],
+]
+
+def observable[T](model: type[T]) -> Store[T]:
+    raise NotImplementedError
+
+class Settings:
+    user_name: str
+    font_size: int
+    dark_mode: bool
+    session_token: Annotated[str, Silent()]
+    _cache: dict[str, str]
+
+def on_font_size(old: int, new: int) -> None: ...
+
+def demo():
+    store = observable(Settings)
+    reveal_type(store.session_token)  # revealed: str
+    store.set_dark_mode(True)
+    store.set_font_size("large")  # error: [invalid-argument-type]
+    unsubscribe = store.onFontSizeChange(on_font_size)
+    reveal_type(unsubscribe)  # revealed: () -> None
+    store.onUserNameChange(on_font_size)  # error: [invalid-argument-type]
+    store.emit("dark_mode", False)
+    store.emit("font_size", "14")  # error: [no-matching-overload]
+    store.onSessionTokenChange  # error: [unresolved-attribute]
+    store.set__cache  # error: [unresolved-attribute]
+```
+
+## Dataclass decorator and builder
+
+[//]: # (playground: slug=showcase-dataclass-builder, phase=6, ts="class decorators cannot change a class type in TypeScript")
+
+`@dataclass` written as a library. The decorator returns `UpdateClass[...]`, which adds members to
+the decorated class: a keyword-only `__init__` whose parameters come from `Attrs`, a `replace` method
+where every parameter is optional, and `__match_args__`. Defaults are read from the class body:
+either a plain value, or the `default` of a `field(...)` call (an `InitField`). `field(init=False)`
+removes a parameter from `__init__`. Next to it, `builder()` derives a fluent builder protocol from
+the same class, with one `with_x` method per field computed with `Concat`, each returning the
+builder again.
+
+```toml
+[environment]
+python-version = "3.14"
+```
+
+```py
+from typing import TYPE_CHECKING, Callable, Literal, Never, ReadOnly, TypedDict
+
+if TYPE_CHECKING:
+    from ty_extensions import (
+        Attrs, Concat, GetArg, GetMemberType, InitField, IsAssignable, IsEquivalent, Iter, Member, NewProtocol, Param, ParamKind, Params, UpdateClass,
+    )
+
+class FieldArgs(TypedDict, total=False):
+    default: ReadOnly[object]
+    init: ReadOnly[bool]
+
+if TYPE_CHECKING:
+    class field[K: FieldArgs](InitField[K]): ...
+else:
+    def field(**kwargs):
+        return None
+
+type KwOnly = Literal[ParamKind.KEYWORD_ONLY]
+type IsField[I] = IsAssignable[I, field] and not IsAssignable[I, Never]
+type Item[I, K] = GetMemberType[GetArg[I, InitField, Literal[0]], K]
+type Default[I] = Item[I, Literal["default"]] if IsField[I] else I
+type InInit[I] = not (IsField[I] and IsEquivalent[Item[I, Literal["init"]], Literal[False]])
+
+type InitFn[T] = Callable[
+    Params[Param[Literal["self"], T], *[Param[p.name, p.type, KwOnly, Default[p.init]] for p in Iter[Attrs[T]] if InInit[p.init]]],
+    None,
+]
+type ReplaceFn[T] = Callable[Params[Param[Literal["self"], T], *[Param[p.name, p.type, KwOnly, p.type] for p in Iter[Attrs[T]]]], T]
+type MatchArgs[T] = tuple[*[p.name for p in Iter[Attrs[T]] if InInit[p.init]]]
+
+def dataclass[T](cls: type[T]) -> UpdateClass[
+    Member[Literal["__init__"], InitFn[T], Literal["ClassVar"]],
+    Member[Literal["replace"], ReplaceFn[T], Literal["ClassVar"]],
+    Member[Literal["__match_args__"], MatchArgs[T], Literal["ClassVar"]],
+]:
+    return cls
+
+type Builder[T] = NewProtocol[
+    *[Member[Concat[Literal["with_"], p.name], Callable[[p.type], Builder[T]]] for p in Iter[Attrs[T]]],
+    Member[Literal["build"], Callable[[], T]],
+]
+
+def builder[T](cls: type[T]) -> Builder[T]:
+    raise NotImplementedError
+
+@dataclass
+class Point:
+    x: int
+    y: int = 0
+    label: str = field(default="origin")
+    cache: dict[str, int] = field(init=False)
+
+def demo(p: Point):
+    reveal_type(Point.__init__)  # revealed: (self: Point, *, x: int, y: int = 0, label: str = "origin") -> None
+    reveal_type(Point(x=1))  # revealed: Point
+    reveal_type(p.replace(y=2))  # revealed: Point
+    reveal_type(Point.__match_args__)  # revealed: tuple[Literal["x"], Literal["y"], Literal["label"]]
+    Point(x="1")  # error: [invalid-argument-type]
+    Point(x=1, cache={})  # error: [unknown-argument]
+    p.replace(z=3)  # error: [unknown-argument]
+    reveal_type(builder(Point).with_x(1).with_label("a").build())  # revealed: Point
+    builder(Point).with_y("2")  # error: [invalid-argument-type]
+```
+
+## Transposing tuples
+
+[//]: # (playground: slug=showcase-transpose, phase=6, ts="type Transpose<Rows extends unknown[][]> = ...")
+
+A strict, typed `zip(*rows)` for rows of fixed length, and `record(keys, values)`, which zips a
+header and a row into a `TypedDict`. `Transpose` is a recursive alias: it takes the first element of
+every row (`GetArg`), then recurses on the rest of every row (`Slice`) until the rows are empty
+(`Length`). Before that, `any()` rejects rows of unknown length and `all()` checks that the rows
+have the same length, so mismatches are reported with `RaiseError` at the call.
+
+```toml
+[environment]
+python-version = "3.14"
+```
+
+```py
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from ty_extensions import GetArg, IsAssignable, IsEquivalent, Iter, Length, Member, NewTypedDict, RaiseError, Slice
+
+type First[T] = GetArg[T, tuple, Literal[0]]
+type Second[T] = GetArg[T, tuple, Literal[1]]
+type Rest[T] = Slice[T, Literal[1], None]
+type Transpose[Rows] = (
+    tuple[()]
+    if IsEquivalent[Length[First[Rows]], Literal[0]]
+    else tuple[tuple[*[First[r] for r in Iter[Rows]]], *Transpose[tuple[*[Rest[r] for r in Iter[Rows]]]]]
+)
+type Checked[Rows] = (
+    RaiseError[Literal["rows must have a fixed length"]]
+    if any(IsAssignable[Length[r], None] for r in Iter[Rows])
+    else Transpose[Rows]
+    if all(IsEquivalent[Length[r], Length[First[Rows]]] for r in Iter[Rows])
+    else RaiseError[Literal["rows have different lengths"], Rows]
+)
+type Record[K, V] = NewTypedDict[*[Member[First[kv], Second[kv]] for kv in Iter[Checked[tuple[K, V]]]]]
+
+def columns[*Rows](*rows: *Rows) -> Checked[tuple[*Rows]]:
+    raise NotImplementedError
+
+def record[K, V](keys: K, values: V) -> Record[K, V]:
+    raise NotImplementedError
+
+def demo(
+    ada: tuple[int, str, float],
+    bob: tuple[bool, str, int],
+    short: tuple[int, str],
+    many: tuple[int, ...],
+    header: tuple[Literal["id"], Literal["name"]],
+):
+    cols = columns(ada, bob)
+    ids: tuple[int, bool] = cols[0]
+    scores: tuple[float, int] = cols[2]
+    wrong: tuple[str, str] = cols[0]  # error: [invalid-assignment]
+    columns(ada, short)  # error: [raised-type-error] "rows have different lengths"
+    columns(ada, many)  # error: [raised-type-error] "rows must have a fixed length"
+    row = record(header, short)
+    reveal_type(row["id"])  # revealed: int
+    reveal_type(row["name"])  # revealed: str
+    row["age"]  # error: [invalid-key]
+```
+
+## Typed task queue
+
+[//]: # (playground: slug=showcase-task-queue, phase=6, ts="perform(args: { [K in keyof Parameters<F>]: ... }): Job<Awaited<ReturnType<F>>>")
+
+A Celery/RQ-style task queue. A task is enqueued with a JSON-like payload, so `perform` takes the
+arguments of the function as a `TypedDict`, like a mapped type over TypeScript's `Parameters<F>`.
+`GetArg[F, Callable, Literal[0]]` is the `Params[...]` of any callable, `GetArgs` turns it into a
+tuple, and `Payload` maps every parameter to an item of a `NewTypedDict`, which is `NotRequired` when
+the parameter has a default (`p.default` is not `Never`). `GetArg[F, Callable, Literal[1]]` is the
+return type (`ReturnType<F>`), and `Job.result()` unwraps coroutines with a conditional type over the
+`Coroutine` base class (`Awaited<T>`). `delay` keeps the original signature, like Celery's
+`task.delay(...)`. A payload cannot fill positional-only parameters, `*args` or `**kwargs`, so instead
+of silently dropping them, `Checked` rejects such functions with `RaiseError` and names the offending
+parameters.
+
+The queue library in `tasks.py` offers three ways to declare a task: a class generic over a callable
+type (`Task[F: Callable[..., object]]`, created by the `@task` decorator), a class generic over a
+`ParamSpec` and a return type (`Task2[**P, R]`, where `ArgsOf[Callable[P, R]]` is evaluated once `P`
+is solved), and a base class whose `__init_subclass__` returns `UpdateClass[...]`: it adds a typed
+`perform` method to every subclass, computed from its `run` method (`Slice` drops `self`).
+
+```toml
+[environment]
+python-version = "3.14"
+```
+
+`tasks.py`:
+
+```py
+from collections.abc import Coroutine
+from typing import TYPE_CHECKING, Any, Callable, Literal, Never, Union
+
+if TYPE_CHECKING:
+    from ty_extensions import (
+        GetArg, GetArgs, GetMemberType, IsAssignable, IsEquivalent, Iter, Member, NewTypedDict, Param, ParamKind, Params, RaiseError, Slice, UpdateClass,
+    )
+
+type ParamsOf[F] = GetArgs[GetArg[F, Callable, Literal[0]], Params]
+type Keyword = Literal[ParamKind.POSITIONAL_OR_KEYWORD, ParamKind.KEYWORD_ONLY]
+type Optional[P] = Never if IsEquivalent[P.default, Never] else Literal["NotRequired"]
+type Payload[Ps] = NewTypedDict[*[Member[p.name, p.type, Optional[p]] for p in Iter[Ps]]]
+type ArgsOf[F] = Payload[ParamsOf[F]]
+type Awaited[R] = GetArg[R, Coroutine, Literal[2]] if IsAssignable[R, Coroutine[Any, Any, Any]] else R
+type Checked[F] = (
+    F
+    if all(IsAssignable[p.kind, Keyword] for p in Iter[ParamsOf[F]])
+    else RaiseError[
+        Literal["task parameters must be passable by keyword"],
+        Union[*[p.name for p in Iter[ParamsOf[F]] if not IsAssignable[p.kind, Keyword]]],
+    ]
+)
+
+class Job[R]:
+    def result(self) -> Awaited[R]:
+        raise NotImplementedError
+
+class Task[F: Callable[..., object]]:
+    delay: Callable[GetArg[F, Callable, Literal[0]], Job[GetArg[F, Callable, Literal[1]]]]
+
+    def perform(self, args: ArgsOf[F]) -> Job[GetArg[F, Callable, Literal[1]]]:
+        raise NotImplementedError
+
+def task[F: Callable[..., object]](f: F) -> Task[Checked[F]]:
+    raise NotImplementedError
+
+class Task2[**P, R]:
+    def perform(self, args: ArgsOf[Callable[P, R]]) -> Job[R]:
+        raise NotImplementedError
+
+def task2[**P, R](f: Callable[P, R]) -> Task2[P, R]:
+    raise NotImplementedError
+
+type RunOf[T] = GetMemberType[T, Literal["run"]]
+type PerformFn[T] = Callable[
+    Params[Param[Literal["self"], T], Param[Literal["args"], Payload[Slice[ParamsOf[RunOf[T]], Literal[1], None]]]],
+    Job[GetArg[RunOf[T], Callable, Literal[1]]],
+]
+
+class TaskBase:
+    def __init_subclass__[T](cls: type[T]) -> UpdateClass[Member[Literal["perform"], PerformFn[T], Literal["ClassVar"]]]:
+        pass
+```
+
+```py
+from tasks import Task2, TaskBase, task, task2
+
+@task
+def send_email(to: str, subject: str, retries: int = 3) -> bool:
+    return True
+
+@task
+async def fetch(url: str, *, timeout: float = 10.0) -> bytes:
+    return b""
+
+def enqueue():
+    reveal_type(send_email.perform({"to": "a@b.c", "subject": "hi"}))  # revealed: Job[bool]
+    reveal_type(send_email.delay)  # revealed: (to: str, subject: str, retries: int = 3) -> Job[bool]
+    reveal_type(fetch.perform({"url": "https://example.com"}).result())  # revealed: bytes
+    # error: [missing-typed-dict-key] "Missing required key 'subject'"
+    # error: [invalid-argument-type]
+    send_email.perform({"to": "a@b.c"})
+    # error: [invalid-argument-type] "Invalid argument to key "retries""
+    # error: [invalid-argument-type]
+    send_email.perform({"to": "a@b.c", "subject": "hi", "retries": "3"})
+    # error: [invalid-key] "Unknown key "cc""
+    # error: [invalid-argument-type]
+    send_email.perform({"to": "a@b.c", "subject": "hi", "cc": "boss@b.c"})
+    send_email.delay("a@b.c", "hi", retries="3")  # error: [invalid-argument-type]
+
+# Functions whose parameters cannot come from a payload are rejected.
+def legacy(path: str, /, *flags: str) -> None: ...
+
+def declare():
+    task(legacy)  # error: [raised-type-error] "task parameters must be passable by keyword: Literal["path", "flags"]"
+
+@task  # error: [raised-type-error] "task parameters must be passable by keyword: Literal["path", "flags"]"
+def legacy_task(path: str, /, *flags: str) -> None: ...
+
+# The `ParamSpec` form and the base class form give the same payload types.
+@task2
+def resize(image: bytes, width: int, height: int = 0) -> bytes:
+    return image
+
+class Report(TaskBase):
+    def run(self, user_id: int, fmt: str = "pdf") -> str:
+        return ""
+
+def other_forms(report: Report):
+    reveal_type(resize.perform({"image": b"", "width": 100}))  # revealed: Job[bytes]
+    reveal_type(report.perform({"user_id": 1}))  # revealed: Job[str]
+    # error: [missing-typed-dict-key]
+    # error: [invalid-argument-type]
+    resize.perform({"image": b""})
+    # error: [invalid-key]
+    # error: [invalid-argument-type]
+    report.perform({"user_id": 1, "self": report})
+```

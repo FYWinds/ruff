@@ -31,6 +31,7 @@ use crate::types::string_annotation::{
     INVALID_SYNTAX_IN_FORWARD_ANNOTATION, RAW_STRING_TYPE_ANNOTATION,
 };
 use crate::types::tuple::TupleSpec;
+use crate::types::type_operator::{RaisedErrorType, find_raised_errors};
 use crate::types::typed_dict::TypedDictSchema;
 use crate::types::typevar::TypeVarInstance;
 use crate::types::unpacker::{starred_assignment_values, unpacked_assignment_value};
@@ -176,6 +177,7 @@ pub(crate) fn register_lints(registry: &mut LintRegistryBuilder) {
     registry.register_lint(&UNUSED_AWAITABLE);
     registry.register_lint(&ZERO_STEPSIZE_IN_SLICE);
     registry.register_lint(&STATIC_ASSERT_ERROR);
+    registry.register_lint(&RAISED_TYPE_ERROR);
     registry.register_lint(&INVALID_ATTRIBUTE_ACCESS);
     registry.register_lint(&DISJOINT_CAST);
     registry.register_lint(&REDUNDANT_CAST);
@@ -1263,6 +1265,15 @@ declare_lint! {
     pub(crate) static STATIC_ASSERT_ERROR = {
         summary: "Failed static assertion",
         status: LintStatus::stable("0.0.1-alpha.1"),
+        default_level: Level::Error,
+    }
+}
+
+declare_lint! {
+    #[doc = include_str!("../../resources/lint_docs/raised-type-error.md")]
+    pub(crate) static RAISED_TYPE_ERROR = {
+        summary: "detects type-level errors raised with `RaiseError`",
+        status: LintStatus::preview("0.0.88"),
         default_level: Level::Error,
     }
 }
@@ -6120,6 +6131,45 @@ pub(super) fn report_subclass_of_class_with_non_callable_init_subclass<'db>(
         }
         CallErrorKind::BindingError => {
             bindings.report_diagnostics(context, class_node.into());
+        }
+    }
+}
+
+/// Reports every error raised with PEP 827 `RaiseError` that `ty`, the type of a type expression
+/// or the specialized return type of a call at `node`, contains (once per message).
+pub(crate) fn report_raised_type_errors<'db>(
+    context: &InferContext<'db, '_>,
+    node: impl Ranged,
+    ty: Type<'db>,
+) {
+    report_raised_type_errors_except(context, node, ty, Vec::new);
+}
+
+/// Like [`report_raised_type_errors`], but does not report the errors returned by `known`, which
+/// have already been reported elsewhere (for example, errors in the argument types of a call
+/// whose return type passes them through). `known` is only called if `ty` raises errors.
+pub(crate) fn report_raised_type_errors_except<'db>(
+    context: &InferContext<'db, '_>,
+    node: impl Ranged,
+    ty: Type<'db>,
+    known: impl FnOnce() -> Vec<RaisedErrorType<'db>>,
+) {
+    if !context.is_lint_enabled(&RAISED_TYPE_ERROR) {
+        return;
+    }
+    let db = context.db();
+    let errors = find_raised_errors(db, context.program_environment(), ty);
+    if errors.is_empty() {
+        return;
+    }
+    let known = known();
+    let range = node.range();
+    for error in errors {
+        if known.contains(&error) {
+            continue;
+        }
+        if let Some(builder) = context.report_lint(&RAISED_TYPE_ERROR, range) {
+            builder.into_diagnostic(error.message(db));
         }
     }
 }

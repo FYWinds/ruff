@@ -20,7 +20,7 @@ use crate::{
             report_implicit_return_type, report_invalid_generator_function_return_type,
             report_invalid_return_type, report_invalid_total_ordering_call,
             report_issubclass_check_against_protocol_with_non_method_members,
-            report_runtime_check_against_non_runtime_checkable_protocol,
+            report_raised_type_errors, report_runtime_check_against_non_runtime_checkable_protocol,
             report_runtime_check_against_typed_dict, report_shadowed_type_variable,
             report_unsound_return_statement,
         },
@@ -1745,6 +1745,12 @@ impl KnownFunction {
                 };
                 let env = builder.context.program_environment();
                 let casted_type = casted_type.project_type_form(db, env);
+                // The type argument of `cast` is a type expression, so a PEP 827 `RaiseError` in
+                // it is reported there. (The return type of the call only passes it through.)
+                if let Some(type_argument) = call_expression.arguments.find_argument_value("typ", 0)
+                {
+                    report_raised_type_errors(&builder.context, type_argument, casted_type);
+                }
                 if source_type.is_equivalent_to(db, env, casted_type)
                     && non_any_dynamic_content(db, env, *source_type).is_absent()
                     && non_any_dynamic_content(db, env, casted_type).is_absent()

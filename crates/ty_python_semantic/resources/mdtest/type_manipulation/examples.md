@@ -620,8 +620,8 @@ full: Movie = {"year": 1979}  # error: [missing-typed-dict-key]
 [//]: # (playground: slug=props-only, phase=2, ts="{ [K in keyof T as T[K] extends Property<any> ? K : never]: T[K]['value'] }")
 
 A variant of the PEP's Prisma-style `PropsOnly`: keep only the attributes whose type is a
-`Property[...]`, and unwrap them with `GetMemberType` (the PEP's version uses `GetArg`, which comes
-in phase 3).
+`Property[...]`, and unwrap them with `GetArg`, which reads the type argument of the `Property`
+base class. Unlike `GetMemberType[p.type, Literal["value"]]`, it does not need a `value` attribute.
 
 ```toml
 [environment]
@@ -632,7 +632,7 @@ python-version = "3.14"
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
-    from ty_extensions import Attrs, GetMemberType, IsAssignable, Iter, Member, NewProtocol
+    from ty_extensions import Attrs, GetArg, IsAssignable, Iter, Member, NewProtocol
 
 class Property[T]:
     value: T
@@ -645,11 +645,277 @@ class User:
     posts: Link
 
 type PropsOnly[T] = NewProtocol[
-    *[Member[p.name, GetMemberType[p.type, Literal["value"]]] for p in Iter[Attrs[T]] if IsAssignable[p.type, Property[Any]]]
+    *[Member[p.name, GetArg[p.type, Property, Literal[0]]] for p in Iter[Attrs[T]] if IsAssignable[p.type, Property[Any]]]
 ]
 
 def f(props: PropsOnly[User]):
     reveal_type(props.name)  # revealed: str
     reveal_type(props.age)  # revealed: int
     props.posts  # error: [unresolved-attribute]
+```
+
+## Type arguments of a base class
+
+[//]: # (playground: slug=get-arg, phase=3, ts="T extends Pointer<infer U> ? U : never")
+
+`GetArg[T, Base, Idx]` reads type argument number `Idx` of `Base`, where `T` is `Base` itself or one
+of its subclasses. This is `PointerArg` from the PEP's Prisma example: it works for every kind of
+`Pointer`.
+
+```toml
+[environment]
+python-version = "3.14"
+```
+
+```py
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from ty_extensions import GetArg
+
+class Pointer[T]: ...
+class Property[T](Pointer[T]): ...
+class MultiLink[T](Pointer[T]): ...
+class Post: ...
+
+type PointerArg[T] = GetArg[T, Pointer, Literal[0]]
+
+def f(
+    a: PointerArg[Property[str]],
+    b: PointerArg[MultiLink[Post]],
+    c: GetArg[dict[str, bytes], dict, Literal[-1]],
+):
+    reveal_type(a)  # revealed: str
+    reveal_type(b)  # revealed: Post
+    reveal_type(c)  # revealed: bytes
+```
+
+## Tuple length
+
+[//]: # (playground: slug=tuple-length, phase=3, ts="T['length']")
+
+`Length[T]` is the length of a tuple type as an `int` literal type. A tuple with an unbounded part
+has no fixed length, so its `Length` is `None`.
+
+```toml
+[environment]
+python-version = "3.14"
+```
+
+```py
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ty_extensions import Length
+
+def f(
+    a: Length[tuple[int, str]],
+    b: Length[tuple[()]],
+    c: Length[tuple[int, ...]],
+    d: Length[tuple[int] | tuple[int, str]],
+):
+    reveal_type(a)  # revealed: Literal[2]
+    reveal_type(b)  # revealed: Literal[0]
+    reveal_type(c)  # revealed: None
+    reveal_type(d)  # revealed: Literal[1, 2]
+```
+
+## Tuple slices and lifting
+
+[//]: # (playground: slug=tuple-slice, phase=3, ts="T extends [...infer Init, any] ? Init : never")
+
+`Slice[S, Start, End]` slices a tuple type like `s[start:end]`. Like most operators, it is *lifted*
+over unions: each combination of union members is evaluated, and the results are joined. This is the
+example from the PEP's section on lifting.
+
+```toml
+[environment]
+python-version = "3.14"
+```
+
+```py
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from ty_extensions import Slice
+
+class A: ...
+class B: ...
+class C: ...
+
+type DropLast[T] = Slice[T, Literal[0], Literal[-1]]
+
+def f(
+    a: DropLast[tuple[A, B, C]],
+    b: Slice[tuple[A, B, C], Literal[1], None],
+    c: Slice[tuple[A, B, C], Literal[0, 1], Literal[2, 3]],
+):
+    reveal_type(a)  # revealed: tuple[A, B]
+    reveal_type(b)  # revealed: tuple[B, C]
+    reveal_type(c)  # revealed: tuple[A, B] | tuple[A, B, C] | tuple[B] | tuple[B, C]
+```
+
+## `any()` and `all()`
+
+[//]: # (playground: slug=any-all, phase=3, ts="T[number] extends number ? true : false")
+
+The builtins `any` and `all` work on type booleans, with a generator over `Iter[...]`. They can be
+used wherever a type boolean can, for example as the condition of a conditional type.
+
+```toml
+[environment]
+python-version = "3.14"
+```
+
+```py
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from ty_extensions import IsAssignable, Iter
+
+type AllInts[T] = Literal["ints"] if all(IsAssignable[t, int] for t in Iter[T]) else Literal["mixed"]
+type HasStr[T] = any(IsAssignable[t, str] for t in Iter[T])
+
+def f(
+    a: AllInts[tuple[int, bool]],
+    b: AllInts[tuple[int, str]],
+    c: HasStr[tuple[int, str]],
+    d: HasStr[tuple[()]],
+):
+    reveal_type(a)  # revealed: Literal["ints"]
+    reveal_type(b)  # revealed: Literal["mixed"]
+    reveal_type(c)  # revealed: Literal[True]
+    reveal_type(d)  # revealed: Literal[False]
+```
+
+## Several `for` clauses
+
+[//]: # (playground: slug=multi-for, phase=3, ts="{ [A in X]: { [B in Y]: [A, B] }[Y] }[X]")
+
+A type comprehension can have several `for` clauses. Later clauses can iterate over something that
+depends on earlier variables, which makes flattening easy.
+
+```toml
+[environment]
+python-version = "3.14"
+```
+
+```py
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ty_extensions import Iter
+
+type Product[X, Y] = tuple[*[tuple[a, b] for a in Iter[X] for b in Iter[Y]]]
+type Flatten[T] = tuple[*[x for row in Iter[T] for x in Iter[row]]]
+
+def f(
+    a: Product[tuple[int, str], tuple[bytes, bool]],
+    b: Flatten[tuple[tuple[int, str], tuple[()], tuple[bytes]]],
+):
+    # revealed: tuple[tuple[int, bytes], tuple[int, bool], tuple[str, bytes], tuple[str, bool]]
+    reveal_type(a)
+    reveal_type(b)  # revealed: tuple[int, str, bytes]
+```
+
+## Iterating unbounded tuples
+
+[//]: # (playground: slug=unbounded-iter, phase=3, ts="{ [K in keyof T]: T[K] | null }")
+
+`Iter` also accepts tuples with an unbounded part. The fixed elements are handled one by one; the
+unbounded part is handled once and stays unbounded, or disappears if it is filtered out.
+
+```toml
+[environment]
+python-version = "3.14"
+```
+
+```py
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ty_extensions import IsAssignable, Iter
+
+type Nullable[T] = tuple[*[x | None for x in Iter[T]]]
+type IntsOnly[T] = tuple[*[x for x in Iter[T] if IsAssignable[x, int]]]
+
+def f(
+    a: Nullable[tuple[int, *tuple[str, ...], bool]],
+    b: IntsOnly[tuple[int, *tuple[str, ...], bool]],
+    c: IntsOnly[tuple[str, *tuple[int, ...]]],
+):
+    reveal_type(a)  # revealed: tuple[int | None, *tuple[str | None, ...], bool | None]
+    reveal_type(b)  # revealed: tuple[int, bool]
+    reveal_type(c)  # revealed: tuple[int, ...]
+```
+
+## A typed `zip`
+
+[//]: # (playground: slug=zip-like, phase=3, ts="{ [K in keyof T]: T[K] extends Iterable<infer E> ? E : never }")
+
+The `zip` example from the PEP: the return type maps every argument type to its element type. `*Ts`
+is solved at the call site, and then the comprehension is evaluated. `ElemOf` finds the element type
+through the `Iterable` base class (a protocol) of each argument. The result's elements are
+`ElemOf[...]` aliases, so we unpack them to see the element types.
+
+```toml
+[environment]
+python-version = "3.14"
+```
+
+```py
+from collections.abc import Iterable, Iterator
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from ty_extensions import GetArg, Iter
+
+type ElemOf[T] = GetArg[T, Iterable, Literal[0]]
+
+def izip[*Ts](*args: *Ts) -> Iterator[tuple[*[ElemOf[t] for t in Iter[tuple[*Ts]]]]]:
+    raise NotImplementedError
+
+def f(a: list[int], b: tuple[str, str], c: dict[bytes, float]):
+    for x, y, z in izip(a, b, c):
+        reveal_type(x)  # revealed: int
+        reveal_type(y)  # revealed: str
+        reveal_type(z)  # revealed: bytes
+```
+
+## Recursive `Zip` with `RaiseError`
+
+[//]: # (playground: slug=raise-error, phase=3, ts="no direct equivalent")
+
+The PEP's `Zip` zips two tuple types by recursion: it drops the last element of both until they are
+empty. If only one of them runs out, `RaiseError` reports an error where `Zip` is used. (The result
+contains the helper aliases `Last[...]`, so we check it by assigning it rather than revealing it.)
+
+```toml
+[environment]
+python-version = "3.14"
+```
+
+```py
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from ty_extensions import Bool, GetArg, IsAssignable, Length, RaiseError, Slice
+
+type DropLast[T] = Slice[T, Literal[0], Literal[-1]]
+type Last[T] = GetArg[T, tuple, Literal[-1]]
+type Empty[T] = IsAssignable[Length[T], Literal[0]]
+type Zip[T, S] = (
+    tuple[()]
+    if Bool[Empty[T]] and Bool[Empty[S]]
+    else RaiseError[Literal["Zip length mismatch"], T, S]
+    if Bool[Empty[T]] or Bool[Empty[S]]
+    else tuple[*Zip[DropLast[T], DropLast[S]], tuple[Last[T], Last[S]]]
+)
+
+def f(
+    ok: Zip[tuple[int, str], tuple[float, bool]],
+    bad: Zip[tuple[int, str], tuple[float]],  # error: [raised-type-error] "Zip length mismatch"
+):
+    pairs: tuple[tuple[int, float], tuple[str, bool]] = ok
+    wrong: tuple[tuple[int, int], tuple[str, bool]] = ok  # error: [invalid-assignment]
 ```

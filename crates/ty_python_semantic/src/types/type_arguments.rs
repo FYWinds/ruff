@@ -1,0 +1,334 @@
+//! Evaluation of the PEP 827 operators that read type arguments, tuple shapes and special class
+//! attributes: `GetArg`, `GetArgs`, `Length`, `Slice` and `GetSpecialAttr`.
+//!
+//! The functions here evaluate a single combination of arguments; lifting over unions, dynamic
+//! arguments and deferral are handled by the caller in [`super::type_operator`].
+
+use ty_module_resolver::file_to_module;
+
+use super::class::ClassType;
+use super::member_introspection::string_literal_type;
+use super::special_form::SpecialFormType;
+use super::tuple::{TupleSpec, TupleSpecBuilder, TupleType};
+use super::{ClassLiteral, KnownClass, LiteralValueType, Type};
+use crate::Db;
+use crate::ProgramEnvironment;
+use crate::subscript::PyIndex;
+
+/// An error from evaluating one of the operators in this module, as a message.
+pub(super) type EvaluationError = String;
+
+/// Normalizes the `Base` argument of `GetArg`/`GetArgs`, as inferred as a type expression.
+///
+/// Only the class of `Base` matters, not its type arguments: the result is the class literal of
+/// the origin class (`tuple` for any tuple type, `type` for `type[...]`), or the `Callable`
+/// special form for a callable type. Dynamic types are returned unchanged. Returns `None` if
+/// `Base` does not denote a class.
+pub(crate) fn normalize_base<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    ty: Type<'db>,
+) -> Option<Type<'db>> {
+    let class = match ty.resolve_type_alias(db) {
+        dynamic @ Type::Dynamic(_) => return Some(dynamic),
+        Type::Callable(_) => return Some(Type::SpecialForm(SpecialFormType::TypingCallable)),
+        Type::SubclassOf(_) => return Some(KnownClass::Type.to_class_literal(db, env)),
+        Type::NominalInstance(instance) => instance.class(db, env),
+        Type::ProtocolInstance(instance) => *instance.class_origin(db)?,
+        Type::TypedDict(typed_dict) => typed_dict.defining_class()?,
+        _ => return None,
+    };
+    Some(Type::ClassLiteral(class.class_literal(db)))
+}
+
+/// Returns the class name used to display a normalized `Base` argument (see [`normalize_base`]).
+pub(crate) fn base_display_name<'db>(db: &'db dyn Db, base: Type<'db>) -> Option<&'db str> {
+    match base {
+        Type::ClassLiteral(class) => Some(class.name(db).as_str()),
+        Type::SpecialForm(form) => Some(form.name()),
+        _ => None,
+    }
+}
+
+/// Parses an index argument: an `int` literal type or a `bool` literal type (as `0`/`1`).
+fn int_literal(ty: Type<'_>) -> Option<i64> {
+    let literal = ty.as_literal_value()?;
+    literal
+        .as_int()
+        .or_else(|| literal.as_bool().map(i64::from))
+}
+
+/// Interprets `ty` as an instance of the class `base` and returns its type arguments as a tuple
+/// spec (flattening the arguments of a `TypeVarTuple` parameter), or `None` if `ty` is not an
+/// instance of a subclass of `base`.
+fn type_arguments_as<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    ty: Type<'db>,
+    base: ClassLiteral<'db>,
+) -> Option<TupleSpec<'db>> {
+    match base.known(db) {
+        Some(KnownClass::Tuple) => {
+            return ty
+                .tuple_instance_spec(db, env)
+                .map(std::borrow::Cow::into_owned);
+        }
+        Some(KnownClass::Type) => {
+            if let Type::SubclassOf(subclass_of) = ty {
+                return Some(TupleSpec::heterogeneous([subclass_of.to_instance(db, env)]));
+            }
+        }
+        _ => {}
+    }
+
+    let class = instance_class(db, env, ty)?;
+    let base_class = class.find_base_specialization(db, base)?;
+    let Some((_, Some(specialization))) = base_class.static_class_literal(db) else {
+        // A non-generic base has no type arguments.
+        return Some(TupleSpec::heterogeneous([]));
+    };
+    let variables = specialization.generic_context(db).variables(db);
+    let mut builder = TupleSpecBuilder::with_capacity(specialization.types(db).len());
+    for (typevar, argument) in variables.zip(specialization.types(db)) {
+        if typevar.is_typevartuple(db)
+            && let Some(spec) = argument.exact_tuple_instance_spec(db)
+        {
+            builder = builder.concat(db, env, &spec);
+        } else {
+            builder.push(*argument);
+        }
+    }
+    Some(builder.build())
+}
+
+/// The class of an instance type, including `TypedDict`s.
+fn instance_class<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    ty: Type<'db>,
+) -> Option<ClassType<'db>> {
+    match ty {
+        Type::TypedDict(typed_dict) => typed_dict.defining_class(),
+        _ => ty.nominal_class(db, env),
+    }
+}
+
+/// Evaluates `GetArg[ty, base, index]` (`index` is `Some`) or `GetArgs[ty, base]` (`index` is
+/// `None`) for non-union, non-dynamic arguments. `base` is normalized by [`normalize_base`].
+pub(super) fn get_arg<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    ty: Type<'db>,
+    base: Type<'db>,
+    index: Option<Type<'db>>,
+) -> Result<Type<'db>, EvaluationError> {
+    let operator = if index.is_some() { "GetArg" } else { "GetArgs" };
+    let index = match index {
+        Some(index) => Some(int_literal(index).ok_or_else(|| {
+            format!(
+                "The index of `{operator}` must be an `int` literal type, but got `{}`",
+                index.display(db, env)
+            )
+        })?),
+        None => None,
+    };
+
+    let base_class = match base {
+        Type::SpecialForm(SpecialFormType::TypingCallable) => {
+            return callable_return_type(db, env, ty, operator, index);
+        }
+        Type::ClassLiteral(class) => class,
+        _ => {
+            return Err(format!(
+                "The `Base` argument of `{operator}` must be a class"
+            ));
+        }
+    };
+    let base_name = base_class.name(db);
+
+    let arguments = type_arguments_as(db, env, ty, base_class).ok_or_else(|| {
+        format!(
+            "`{operator}` requires a subclass of `{base_name}`, but got `{}`",
+            ty.display(db, env)
+        )
+    })?;
+
+    let Some(index) = index else {
+        return Ok(Type::tuple(TupleType::new(db, env, &arguments)));
+    };
+    i32::try_from(index)
+        .ok()
+        .and_then(|index| (&arguments).py_index(db, env, index).ok())
+        .ok_or_else(|| {
+            format!(
+                "Index {index} is out of range for `{}` as `{base_name}`",
+                ty.display(db, env)
+            )
+        })
+}
+
+/// `GetArg[ty, Callable, index]`: only the return type (index `1` or `-1`) of a callable with a
+/// single, non-generic signature is supported for now.
+fn callable_return_type<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    ty: Type<'db>,
+    operator: &str,
+    index: Option<i64>,
+) -> Result<Type<'db>, EvaluationError> {
+    if !matches!(index, Some(1 | -1)) {
+        return Err(format!(
+            "Getting the parameters of a `Callable` with `{operator}` is not supported yet"
+        ));
+    }
+    let callable = ty
+        .try_upcast_to_callable(db, env)
+        .and_then(|callables| callables.exactly_one())
+        .ok_or_else(|| {
+            format!(
+                "`{operator}` requires a callable type, but got `{}`",
+                ty.display(db, env)
+            )
+        })?;
+    let [signature] = &callable.signatures(db).overloads[..] else {
+        return Err(format!(
+            "Getting the return type of an overloaded callable with `{operator}` is not \
+             supported yet"
+        ));
+    };
+    let return_ty = signature.return_ty;
+    if let Some(generic_context) = signature.generic_context {
+        // Methods get a synthetic `Self` type variable; that is fine as long as the return type
+        // does not mention it. Any other type variable would escape its signature.
+        let only_unused_self = generic_context.variables(db).all(|typevar| {
+            typevar.typevar(db).is_self(db)
+                && !return_ty.references_typevar(db, env, typevar.typevar(db).identity(db))
+        });
+        if !only_unused_self {
+            return Err(format!(
+                "Getting the return type of a generic callable with `{operator}` is not \
+                 supported yet"
+            ));
+        }
+    }
+    Ok(return_ty)
+}
+
+/// Evaluates `Length[ty]` for a non-union, non-dynamic argument.
+pub(super) fn length<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    ty: Type<'db>,
+) -> Result<Type<'db>, EvaluationError> {
+    let spec = ty.tuple_instance_spec(db, env).ok_or_else(|| {
+        format!(
+            "`Length` requires a tuple type, but got `{}`",
+            ty.display(db, env)
+        )
+    })?;
+    Ok(match spec.len().into_fixed_length() {
+        Some(length) => Type::LiteralValue(LiteralValueType::unpromotable(
+            i64::try_from(length).unwrap_or(i64::MAX),
+        )),
+        None => Type::none(db, env),
+    })
+}
+
+/// Parses a `Start`/`End` argument of `Slice`: an `int` literal type, a `bool` literal type or
+/// `None`.
+fn slice_index<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    ty: Type<'db>,
+    which: &str,
+) -> Result<Option<i32>, EvaluationError> {
+    if ty.is_none(db) {
+        return Ok(None);
+    }
+    let invalid = || {
+        format!(
+            "The {which} index of `Slice` must be an `int` literal type or `None`, but got `{}`",
+            ty.display(db, env)
+        )
+    };
+    let index = int_literal(ty).ok_or_else(invalid)?;
+    // Indexes beyond the range of `i32` behave like the saturated values for any tuple ty can
+    // represent.
+    Ok(Some(i32::try_from(index).unwrap_or(if index < 0 {
+        i32::MIN
+    } else {
+        i32::MAX
+    })))
+}
+
+/// Evaluates `Slice[sequence, start, end]` for non-union, non-dynamic arguments.
+pub(super) fn slice<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    sequence: Type<'db>,
+    start: Type<'db>,
+    end: Type<'db>,
+) -> Result<Type<'db>, EvaluationError> {
+    let start = slice_index(db, env, start, "start")?;
+    let end = slice_index(db, env, end, "end")?;
+    let spec = sequence.tuple_instance_spec(db, env).ok_or_else(|| {
+        format!(
+            "`Slice` requires a tuple type, but got `{}`",
+            sequence.display(db, env)
+        )
+    })?;
+    // The step is always `1`, so the slice cannot fail.
+    Ok(spec
+        .py_slice_type(db, env, start, end, None)
+        .unwrap_or_else(|_| Type::unknown()))
+}
+
+/// The special class attributes that `GetSpecialAttr` supports.
+const SPECIAL_ATTRIBUTES: [&str; 3] = ["__name__", "__module__", "__qualname__"];
+
+/// Evaluates `GetSpecialAttr[ty, attribute]` for non-union, non-dynamic arguments.
+pub(super) fn get_special_attr<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    ty: Type<'db>,
+    attribute: Type<'db>,
+) -> Result<Type<'db>, EvaluationError> {
+    let Some(attribute_name) = attribute.as_string_literal() else {
+        return Err(format!(
+            "The second argument to `GetSpecialAttr` must be a string literal type, but got `{}`",
+            attribute.display(db, env)
+        ));
+    };
+    let attribute_name = attribute_name.value(db);
+    if !SPECIAL_ATTRIBUTES.contains(&attribute_name) {
+        return Err(
+            "`GetSpecialAttr` supports only `__name__`, `__module__` and `__qualname__`"
+                .to_string(),
+        );
+    }
+
+    // If `x: ty`, the attribute is read from `type(x)`: the class of an instance, or the
+    // metaclass of a class object.
+    let class = match ty {
+        Type::SubclassOf(subclass_of) => subclass_of
+            .to_metaclass_instance(db, env)
+            .nominal_class(db, env),
+        _ => instance_class(db, env, ty),
+    }
+    .ok_or_else(|| {
+        format!(
+            "`GetSpecialAttr` requires a class, but got `{}`",
+            ty.display(db, env)
+        )
+    })?;
+    let class = class.class_literal(db);
+
+    let value = match attribute_name {
+        "__name__" => class.name(db).to_string(),
+        "__qualname__" => class.qualified_name(db).python_qualname(),
+        _ => file_to_module(db, class.program_file(db).resolver_file(db))
+            .map(|module| module.name(db).as_str().to_string())
+            .ok_or_else(|| format!("The module of `{}` is unknown", ty.display(db, env)))?,
+    };
+    Ok(string_literal_type(db, &value))
+}

@@ -28,13 +28,16 @@ use super::member_introspection::{
 };
 use super::signatures::CallableSignature;
 use super::tuple::{Tuple, TupleSpec, TupleSpecBuilder, TupleType, VariableSegment};
+use super::type_alias::alias_has_type_operator;
+use super::type_arguments;
+pub(crate) use super::type_arguments::normalize_base;
 use super::typed_dict::{TypedDictFieldBuilder, TypedDictSchema};
 use super::variance::{VarianceInferable, VarianceTerm};
 use super::visitor::{TypeCollector, TypeVisitor};
 use super::{
-    ApplyTypeMappingVisitor, BoundTypeVarIdentity, BoundTypeVarInstance, CallableType,
-    IntersectionType, KnownClass, LiteralValueType, PromotionMode, Type, TypeContext, TypeMapping,
-    TypeVarVariance, TypedDictType, UnionBuilder, UnionType, visitor,
+    ApplyTypeMappingVisitor, BoundTypeVarIdentity, BoundTypeVarInstance, CallableType, DynamicType,
+    IntersectionType, KnownClass, LiteralValueType, PromotionMode, Type, TypeAliasType,
+    TypeContext, TypeMapping, TypeVarVariance, TypedDictType, UnionBuilder, UnionType, visitor,
 };
 use crate::Db;
 use crate::ProgramEnvironment;
@@ -157,10 +160,14 @@ pub enum TypeOperatorKind<'db> {
     /// `m.name`, `m.type`, ...
     MemberAccess(Type<'db>, MemberField),
     /// `*[body for binder in Iter[iterable] if c1 if c2 ...]`
+    ///
+    /// The body is [`VariadicArg::Single`] for a plain element, and [`VariadicArg::Unpacked`]
+    /// for an element written as `Unpack[X]` or for a nested comprehension (a further `for`
+    /// clause), in which case every element contributes several types.
     UnpackMap {
         iterable: Type<'db>,
         binder: BoundTypeVarInstance<'db>,
-        body: Type<'db>,
+        body: VariadicArg<'db>,
         conditions: Box<[Type<'db>]>,
     },
     /// `tuple[...]` with an unresolved unpacked argument.
@@ -171,6 +178,26 @@ pub enum TypeOperatorKind<'db> {
     NewProtocol(Box<[VariadicArg<'db>]>),
     /// `NewTypedDict[...]`
     NewTypedDict(Box<[VariadicArg<'db>]>),
+    /// `GetArg[T, Base, Idx]`; `Base` is normalized by [`normalize_base`].
+    GetArg(Type<'db>, Type<'db>, Type<'db>),
+    /// `GetArgs[T, Base]`; `Base` is normalized by [`normalize_base`].
+    GetArgs(Type<'db>, Type<'db>),
+    /// `Length[T]`
+    Length(Type<'db>),
+    /// `Slice[S, Start, End]`
+    Slice(Type<'db>, Type<'db>, Type<'db>),
+    /// `GetSpecialAttr[T, Attr]`
+    GetSpecialAttr(Type<'db>, Type<'db>),
+    /// `RaiseError[S, *Ts]`. Only exists in this form while its operands contain unsolved type
+    /// variables; once evaluated, it becomes [`DynamicType::RaisedError`].
+    RaiseError {
+        message: Type<'db>,
+        args: Box<[VariadicArg<'db>]>,
+    },
+    /// `any(...)` (`all == false`) or `all(...)` (`all == true`). `elements` is the generator
+    /// evaluated as an unpacked comprehension: a tuple of type booleans, or an unresolved
+    /// `UnpackMap`.
+    Quantifier { all: bool, elements: Type<'db> },
 }
 
 /// How an operand contributes to the result of an operator.
@@ -180,6 +207,10 @@ enum OperandRole {
     /// `Attrs`). Such operands are compared as written: they are not promoted or materialized,
     /// and type variables in them are invariant.
     Input,
+    /// Like [`OperandRole::Input`], the operand is not promoted or materialized, but the result
+    /// varies covariantly with it (e.g. the sequence argument of `Slice`, whose result is a
+    /// subsequence of it).
+    CovariantInput,
     /// The operand becomes (part of) the result (e.g. the branches of a conditional type, or the
     /// elements of `tuple[...]`). Such operands are covariant.
     Output,
@@ -202,7 +233,27 @@ impl<'db> TypeOperatorKind<'db> {
             | Self::Attrs(a)
             | Self::Members(a)
             | Self::FromUnion(a)
-            | Self::MemberAccess(a, _) => f(*a, Input),
+            | Self::MemberAccess(a, _)
+            | Self::Length(a)
+            | Self::Quantifier { elements: a, .. } => f(*a, Input),
+            Self::GetArgs(a, b) | Self::GetSpecialAttr(a, b) => {
+                f(*a, Input);
+                f(*b, Input);
+            }
+            Self::GetArg(a, b, c) => {
+                f(*a, Input);
+                f(*b, Input);
+                f(*c, Input);
+            }
+            Self::Slice(sequence, start, end) => {
+                f(*sequence, OperandRole::CovariantInput);
+                f(*start, Input);
+                f(*end, Input);
+            }
+            Self::RaiseError { message, args } => {
+                f(*message, Input);
+                args.iter().for_each(|arg| f(arg.ty(), Input));
+            }
             Self::And(operands) | Self::Or(operands) => {
                 operands.iter().for_each(|ty| f(*ty, Input));
             }
@@ -223,7 +274,7 @@ impl<'db> TypeOperatorKind<'db> {
             } => {
                 f(*iterable, Input);
                 conditions.iter().for_each(|ty| f(*ty, Input));
-                f(*body, Output);
+                f(body.ty(), Output);
             }
             Self::TupleOf(args) | Self::UnionOf(args) => {
                 args.iter().for_each(|arg| f(arg.ty(), Output));
@@ -293,7 +344,7 @@ impl<'db> TypeOperatorKind<'db> {
                     .iter()
                     .map(|ty| f(*ty, Input))
                     .collect::<Option<_>>()?,
-                body: f(*body, Output)?,
+                body: body.with_ty(f(body.ty(), Output)?),
                 binder: *binder,
             },
             Self::TupleOf(args) => Self::TupleOf(Self::map_args(args, |ty| f(ty, Output))?),
@@ -302,6 +353,35 @@ impl<'db> TypeOperatorKind<'db> {
             Self::NewTypedDict(args) => {
                 Self::NewTypedDict(Self::map_args(args, |ty| f(ty, Input))?)
             }
+            Self::GetArg(a, b, c) => {
+                let [a, b, c] = [*a, *b, *c].map(|ty| f(ty, Input));
+                Self::GetArg(a?, b?, c?)
+            }
+            Self::GetArgs(a, b) => {
+                let [a, b] = [*a, *b].map(|ty| f(ty, Input));
+                Self::GetArgs(a?, b?)
+            }
+            Self::Length(a) => Self::Length(f(*a, Input)?),
+            Self::Slice(sequence, start, end) => {
+                let sequence = f(*sequence, OperandRole::CovariantInput);
+                let [start, end] = [*start, *end].map(|ty| f(ty, Input));
+                Self::Slice(sequence?, start?, end?)
+            }
+            Self::GetSpecialAttr(a, b) => {
+                let [a, b] = [*a, *b].map(|ty| f(ty, Input));
+                Self::GetSpecialAttr(a?, b?)
+            }
+            Self::RaiseError { message, args } => {
+                let message = f(*message, Input)?;
+                Self::RaiseError {
+                    message,
+                    args: Self::map_args(args, |ty| f(ty, Input))?,
+                }
+            }
+            Self::Quantifier { all, elements } => Self::Quantifier {
+                all: *all,
+                elements: f(*elements, Input)?,
+            },
         })
     }
 
@@ -348,12 +428,54 @@ type OperatorResult<'db> = Result<Type<'db>, TypeOperatorError>;
 pub(crate) enum Sequence<'db> {
     /// A sequence of known length.
     Fixed(Vec<Type<'db>>),
-    /// A sequence of unknown length and contents (e.g. `Any`).
-    Dynamic,
-    /// The sequence depends on unsolved type variables.
+    /// A sequence with an unbounded part: the `prefix`, any number of `element`s, then the
+    /// `suffix` (e.g. `tuple[int, *tuple[str, ...], bytes]`).
+    Unbounded {
+        prefix: Vec<Type<'db>>,
+        element: Type<'db>,
+        suffix: Vec<Type<'db>>,
+    },
+    /// A sequence of unknown length and contents, carrying the dynamic type it stems from
+    /// (`Any`, `Unknown`, a raised error, ...).
+    Dynamic(Type<'db>),
+    /// The sequence depends on unsolved type variables (including `tuple[*Ts]`).
     Deferred,
     /// The type does not describe a supported sequence.
     Error,
+}
+
+/// The payload of [`DynamicType::RaisedError`]: the message of an evaluated
+/// `RaiseError[S, *Ts]`.
+#[salsa::interned(debug, heap_size=ruff_memory_usage::heap_size)]
+pub struct RaisedErrorType<'db> {
+    #[returns(deref)]
+    pub(crate) message: Box<str>,
+}
+
+// The Salsa heap is tracked separately.
+impl get_size2::GetSize for RaisedErrorType<'_> {}
+
+/// Returns `true` if `ty` is a type alias with type operators whose arguments contain unsolved
+/// type variables. Such an alias is not resolved while evaluating an operator: its value is not
+/// known yet, and resolving a recursive alias (`tuple[*Zip[DropLast[T], DropLast[S]], ...]`)
+/// would expand it without end.
+pub(crate) fn is_unresolved_alias<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    ty: Type<'db>,
+) -> bool {
+    match ty {
+        Type::TypeAlias(alias) => needs_deferral(db, env, ty) && alias_has_type_operator(db, alias),
+        _ => false,
+    }
+}
+
+/// Returns the raised error marker if `ty` (after resolving type aliases) is one.
+fn as_raised_error<'db>(db: &'db dyn Db, ty: Type<'db>) -> Option<Type<'db>> {
+    match ty.resolve_type_alias(db) {
+        raised @ Type::Dynamic(DynamicType::RaisedError(_)) => Some(raised),
+        _ => None,
+    }
 }
 
 /// The value of a type boolean operand, as far as it can be determined.
@@ -363,6 +485,8 @@ enum TypeBoolValue<'db> {
     Known(bool),
     /// `bool`: a type boolean that is not statically known.
     Indeterminate,
+    /// A raised error (`DynamicType::RaisedError`); it propagates to the result.
+    Raised(Type<'db>),
     /// A dynamic type (`Any`, `Unknown`, ...).
     Dynamic(Type<'db>),
     /// An unresolved type boolean that depends on unsolved type variables.
@@ -382,6 +506,7 @@ impl<'db> TypeBoolValue<'db> {
             Type::NominalInstance(instance) if instance.has_known_class(db, KnownClass::Bool) => {
                 Self::Indeterminate
             }
+            Type::Dynamic(DynamicType::RaisedError(_)) => Self::Raised(resolved),
             Type::Dynamic(_) => Self::Dynamic(resolved),
             // An unresolved operator. (An unresolved conditional type may still evaluate to a
             // type boolean once its condition is known.)
@@ -514,10 +639,186 @@ impl<'db> visitor::TypeVisitor<'db> for FreeTypeVarVisitor<'db, '_> {
             walk_function_type(db, function, self);
         });
     }
+
+    // The bounds and defaults of a signature's own type parameters (such as the synthetic
+    // `Self` of a method, bounded by the unspecialized class) do not make the signature depend
+    // on outer type variables.
+    fn visit_bound_type_var_type(&self, db: &'db dyn Db, bound_typevar: BoundTypeVarInstance<'db>) {
+        if !self.bound.borrow().contains(&bound_typevar.identity(db)) {
+            super::typevar::walk_bound_type_var_type(db, bound_typevar, self);
+        }
+    }
 }
 
 fn type_bool<'db>(value: bool) -> Type<'db> {
     Type::LiteralValue(LiteralValueType::unpromotable(value))
+}
+
+/// Evaluate the `and` (`short_circuit == false`) or `or` (`short_circuit == true`) of type
+/// booleans; `any(...)` and `all(...)` use the same rules over their evaluated elements. Returns
+/// `None` if the result must be deferred.
+///
+/// Any operand equal to `short_circuit` decides the result, even if other operands are still
+/// unresolved. Without operands, the result is `not short_circuit`.
+fn evaluate_connective<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    operands: &[Type<'db>],
+    short_circuit: bool,
+) -> Option<Type<'db>> {
+    let mut deferred = false;
+    let mut raised = None;
+    let mut dynamic = None;
+    let mut indeterminate = false;
+    let mut invalid = false;
+
+    for operand in operands {
+        match TypeBoolValue::of(db, env, *operand) {
+            TypeBoolValue::Known(value) if value == short_circuit => {
+                return Some(type_bool(short_circuit));
+            }
+            TypeBoolValue::Known(_) => {}
+            TypeBoolValue::Indeterminate => indeterminate = true,
+            TypeBoolValue::Raised(ty) => raised = raised.or(Some(ty)),
+            TypeBoolValue::Dynamic(ty) => dynamic = dynamic.or(Some(ty)),
+            TypeBoolValue::Deferred => deferred = true,
+            TypeBoolValue::NotABool => invalid = true,
+        }
+    }
+
+    if invalid {
+        Some(Type::unknown())
+    } else if deferred {
+        None
+    } else if let Some(dynamic) = raised.or(dynamic) {
+        Some(dynamic)
+    } else if indeterminate {
+        Some(KnownClass::Bool.to_instance(db, env))
+    } else {
+        Some(type_bool(!short_circuit))
+    }
+}
+
+/// The result of splicing an unpacked sequence into a tuple.
+enum Spliced<'db> {
+    Done(TupleSpecBuilder<'db>),
+    Deferred,
+    /// The unpacked sequence is a raised error; the result is that error.
+    Raised(Type<'db>),
+}
+
+/// Splices the unpacked sequence `ty` (`*ty`) onto the end of `builder`. `context` names the
+/// enclosing construct in error messages.
+fn concat_unpacked<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    builder: TupleSpecBuilder<'db>,
+    ty: Type<'db>,
+    context: &str,
+) -> Result<Spliced<'db>, TypeOperatorError> {
+    if is_unresolved_alias(db, env, ty) {
+        return Ok(Spliced::Deferred);
+    }
+    let resolved = ty.resolve_type_alias(db);
+    if let Some(spec) = resolved.exact_tuple_instance_spec(db) {
+        return Ok(Spliced::Done(builder.concat(db, env, &spec)));
+    }
+    if let Type::TypeVar(typevar) = resolved
+        && typevar.is_typevartuple(db)
+    {
+        return Ok(Spliced::Done(
+            builder.concat_variadic_typevar(db, env, typevar),
+        ));
+    }
+    Ok(match try_evaluate_sequence(db, env, resolved)? {
+        Sequence::Fixed(elements) => {
+            Spliced::Done(builder.concat(db, env, &TupleSpec::heterogeneous(elements)))
+        }
+        Sequence::Unbounded {
+            prefix,
+            element,
+            suffix,
+        } => {
+            let mut builder = builder.concat(db, env, &TupleSpec::heterogeneous(prefix));
+            builder = builder.concat(db, env, &TupleSpec::homogeneous(element));
+            Spliced::Done(builder.concat(db, env, &TupleSpec::heterogeneous(suffix)))
+        }
+        Sequence::Dynamic(dynamic) if as_raised_error(db, dynamic).is_some() => {
+            Spliced::Raised(dynamic)
+        }
+        Sequence::Dynamic(dynamic) => {
+            Spliced::Done(builder.concat(db, env, &TupleSpec::homogeneous(dynamic)))
+        }
+        Sequence::Deferred => Spliced::Deferred,
+        Sequence::Error => {
+            return Err(TypeOperatorError::new(format!(
+                "Cannot unpack `{}` in `{context}`",
+                ty.display(db, env)
+            )));
+        }
+    })
+}
+
+/// Returns the raised errors (`DynamicType::RaisedError`) in `ty`, in order and without
+/// duplicates, for reporting where a type is used.
+///
+/// The values of type aliases are searched if they contain type operators (see
+/// [`alias_has_type_operator`]). Unresolved operators are not searched: an error in them has not
+/// been raised yet.
+pub(crate) fn find_raised_errors<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    ty: Type<'db>,
+) -> Vec<RaisedErrorType<'db>> {
+    struct RaisedErrorVisitor<'db, 'a> {
+        env: &'a ProgramEnvironment<'db>,
+        recursion_guard: TypeCollector<'db>,
+        seen_aliases: RefCell<Vec<TypeAliasType<'db>>>,
+        found: RefCell<Vec<RaisedErrorType<'db>>>,
+    }
+
+    impl<'db> visitor::TypeVisitor<'db> for RaisedErrorVisitor<'db, '_> {
+        fn program_environment(&self) -> &ProgramEnvironment<'db> {
+            self.env
+        }
+
+        fn should_visit_lazy_type_attributes(&self) -> bool {
+            false
+        }
+
+        fn visit_type(&self, db: &'db dyn Db, ty: Type<'db>) {
+            match ty {
+                Type::Dynamic(DynamicType::RaisedError(raised)) => {
+                    let mut found = self.found.borrow_mut();
+                    if !found.contains(&raised) {
+                        found.push(raised);
+                    }
+                }
+                Type::TypeOperator(_) => {}
+                Type::TypeAlias(alias) => {
+                    if self.seen_aliases.borrow().contains(&alias) {
+                        return;
+                    }
+                    self.seen_aliases.borrow_mut().push(alias);
+                    if alias_has_type_operator(db, alias) {
+                        self.visit_type(db, alias.value_type(db));
+                    } else if let Some(specialization) = alias.specialization(db) {
+                        walk_specialization_types(db, specialization, self);
+                    }
+                }
+                _ => visitor::walk_type_with_recursion_guard(db, ty, self, &self.recursion_guard),
+            }
+        }
+    }
+
+    let visitor = RaisedErrorVisitor {
+        env,
+        recursion_guard: TypeCollector::default(),
+        seen_aliases: RefCell::default(),
+        found: RefCell::default(),
+    };
+    visitor.visit_type(db, ty);
+    visitor.found.into_inner()
 }
 
 /// Creates the synthetic type variable bound by a type-level comprehension
@@ -566,9 +867,10 @@ pub(crate) fn member_access<'db>(
 /// Determines the elements of `ty` when it is unpacked in a variadic position or iterated over in
 /// a type-level comprehension.
 ///
-/// Fixed-length tuples produce their elements, `Never` produces no elements, and dynamic types
-/// (and `tuple[Any, ...]`) produce a dynamic sequence. Unions, unbounded tuples and non-tuples are
-/// errors.
+/// Fixed-length tuples produce their elements, `Never` produces no elements, unbounded tuples
+/// produce their prefix, the element type of their unbounded part, and their suffix, dynamic types
+/// (and `tuple[Any, ...]`) produce a dynamic sequence, and `tuple[*Ts]` is deferred. Unions and
+/// non-tuples are errors.
 pub(crate) fn evaluate_sequence<'db>(
     db: &'db dyn Db,
     env: &ProgramEnvironment<'db>,
@@ -582,34 +884,36 @@ fn try_evaluate_sequence<'db>(
     env: &ProgramEnvironment<'db>,
     ty: Type<'db>,
 ) -> Result<Sequence<'db>, TypeOperatorError> {
+    if is_unresolved_alias(db, env, ty) {
+        return Ok(Sequence::Deferred);
+    }
     let resolved = ty.resolve_type_alias(db);
     match resolved {
         Type::Never => return Ok(Sequence::Fixed(Vec::new())),
-        Type::Dynamic(_) => return Ok(Sequence::Dynamic),
+        Type::Dynamic(_) => return Ok(Sequence::Dynamic(resolved)),
         _ => {}
     }
     if let Some(spec) = resolved.exact_tuple_instance_spec(db) {
-        return match spec.as_ref() {
-            Tuple::Fixed(fixed) => Ok(Sequence::Fixed(fixed.all_elements().to_vec())),
-            Tuple::Variable(variable) => {
-                if variable.prefix_elements().is_empty()
-                    && variable.suffix_elements().is_empty()
-                    && matches!(
-                        variable.variable(),
-                        VariableSegment::Homogeneous(element) if element.is_dynamic()
-                    )
+        return Ok(match spec.as_ref() {
+            Tuple::Fixed(fixed) => Sequence::Fixed(fixed.all_elements().to_vec()),
+            Tuple::Variable(variable) => match variable.variable() {
+                // `*Ts` must not be iterated with `iter_element_types`, which turns it into
+                // `object`: wait until `Ts` is solved.
+                VariableSegment::TypeVarTuple(_) => Sequence::Deferred,
+                VariableSegment::Homogeneous(element)
+                    if element.is_dynamic()
+                        && variable.prefix_elements().is_empty()
+                        && variable.suffix_elements().is_empty() =>
                 {
-                    Ok(Sequence::Dynamic)
-                } else {
-                    // Iterating over unbounded tuples, including `tuple[*Ts]`, is not supported
-                    // yet, even if specialization could later make them bounded.
-                    Err(TypeOperatorError::new(format!(
-                        "Iterating over the unbounded tuple `{}` is not yet supported",
-                        resolved.display(db, env)
-                    )))
+                    Sequence::Dynamic(element)
                 }
-            }
-        };
+                VariableSegment::Homogeneous(element) => Sequence::Unbounded {
+                    prefix: variable.prefix_elements().to_vec(),
+                    element,
+                    suffix: variable.suffix_elements().to_vec(),
+                },
+            },
+        });
     }
     if needs_deferral(db, env, resolved) {
         return Ok(Sequence::Deferred);
@@ -626,6 +930,41 @@ fn try_evaluate_sequence<'db>(
     )))
 }
 
+/// Returns the members of `ty` viewed as a union, after resolving type aliases. Union members that
+/// are themselves aliases of unions are flattened recursively (in a type expression, `A | B`
+/// keeps the alias `A` as a member). `Never` has no members.
+fn flattened_union_elements<'db>(db: &'db dyn Db, ty: Type<'db>) -> Vec<Type<'db>> {
+    fn collect<'db>(
+        db: &'db dyn Db,
+        ty: Type<'db>,
+        seen_aliases: &mut Vec<Type<'db>>,
+        out: &mut Vec<Type<'db>>,
+    ) {
+        if matches!(ty, Type::TypeAlias(_)) {
+            if seen_aliases.contains(&ty) {
+                return;
+            }
+            seen_aliases.push(ty);
+        }
+        match ty.resolve_type_alias(db) {
+            Type::Union(union) => {
+                for element in union.elements(db) {
+                    collect(db, *element, seen_aliases, out);
+                }
+            }
+            Type::Never => {}
+            resolved => {
+                if !out.contains(&resolved) {
+                    out.push(resolved);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    collect(db, ty, &mut Vec::new(), &mut out);
+    out
+}
+
 /// Evaluates `f` for every combination of the union elements of `args` and unions the results
 /// (PEP 827 "lifting over unions"). `Never` has no elements, so any `Never` argument makes the
 /// result `Never`.
@@ -637,11 +976,7 @@ fn lift_over_unions<'db>(
 ) -> OperatorResult<'db> {
     let elements: Vec<Vec<Type<'db>>> = args
         .iter()
-        .map(|arg| match arg.resolve_type_alias(db) {
-            Type::Union(union) => union.elements(db).to_vec(),
-            Type::Never => Vec::new(),
-            resolved => vec![resolved],
-        })
+        .map(|arg| flattened_union_elements(db, *arg))
         .collect();
 
     let combinations = elements
@@ -685,7 +1020,8 @@ fn lift_over_unions<'db>(
 /// The members described by the arguments of `NewProtocol`/`NewTypedDict`.
 enum SynthesisMembers<'db> {
     Members(Vec<SynthesisMember<'db>>),
-    Dynamic,
+    /// An argument is dynamic; the result is that dynamic type.
+    Dynamic(Type<'db>),
     Deferred,
 }
 
@@ -715,6 +1051,19 @@ impl<'db> TypeOperatorType<'db> {
         kind: TypeOperatorKind<'db>,
     ) -> OperatorResult<'db> {
         let defer = |kind| Ok(Type::TypeOperator(TypeOperatorType::new(db, kind)));
+
+        // An operator that reads a raised error evaluates to that error (lazy propagation: an
+        // error in an operand that only becomes part of the result is kept where it is).
+        let mut raised = None;
+        kind.for_each_operand_with_role(|ty, role| {
+            if raised.is_none() && role != OperandRole::Output && !is_unresolved_alias(db, env, ty)
+            {
+                raised = as_raised_error(db, ty);
+            }
+        });
+        if let Some(raised) = raised {
+            return Ok(raised);
+        }
 
         match &kind {
             TypeOperatorKind::IsAssignable(source, target) => {
@@ -755,16 +1104,14 @@ impl<'db> TypeOperatorType<'db> {
             TypeOperatorKind::Not(operand) => Ok(match TypeBoolValue::of(db, env, *operand) {
                 TypeBoolValue::Known(value) => type_bool(!value),
                 TypeBoolValue::Indeterminate => KnownClass::Bool.to_instance(db, env),
-                TypeBoolValue::Dynamic(dynamic) => dynamic,
+                TypeBoolValue::Raised(dynamic) | TypeBoolValue::Dynamic(dynamic) => dynamic,
                 TypeBoolValue::Deferred => return defer(kind),
                 TypeBoolValue::NotABool => Type::unknown(),
             }),
-            TypeOperatorKind::And(operands) => {
-                Ok(Self::evaluate_connective(db, env, &kind, operands, false))
-            }
-            TypeOperatorKind::Or(operands) => {
-                Ok(Self::evaluate_connective(db, env, &kind, operands, true))
-            }
+            TypeOperatorKind::And(operands) => Ok(evaluate_connective(db, env, operands, false)
+                .unwrap_or_else(|| Type::TypeOperator(TypeOperatorType::new(db, kind.clone())))),
+            TypeOperatorKind::Or(operands) => Ok(evaluate_connective(db, env, operands, true)
+                .unwrap_or_else(|| Type::TypeOperator(TypeOperatorType::new(db, kind.clone())))),
             TypeOperatorKind::Conditional {
                 condition,
                 if_true,
@@ -774,6 +1121,7 @@ impl<'db> TypeOperatorType<'db> {
                 TypeBoolValue::Known(false)
                 | TypeBoolValue::Indeterminate
                 | TypeBoolValue::NotABool => *if_false,
+                TypeBoolValue::Raised(raised) => raised,
                 TypeBoolValue::Dynamic(_) => {
                     UnionType::from_two_elements(db, env, *if_true, *if_false)
                 }
@@ -846,13 +1194,11 @@ impl<'db> TypeOperatorType<'db> {
                 if needs_deferral(db, env, *ty) {
                     return defer(kind);
                 }
-                Ok(match ty.resolve_type_alias(db) {
-                    Type::Union(union) => {
-                        Type::heterogeneous_tuple(db, env, union.elements(db).iter().copied())
-                    }
-                    Type::Never => Type::empty_tuple(db, env),
-                    resolved => Type::heterogeneous_tuple(db, env, [resolved]),
-                })
+                Ok(Type::heterogeneous_tuple(
+                    db,
+                    env,
+                    flattened_union_elements(db, *ty),
+                ))
             }
             TypeOperatorKind::MemberAccess(ty, field) => member_access(db, env, *ty, *field)
                 .map_err(|()| {
@@ -873,7 +1219,7 @@ impl<'db> TypeOperatorType<'db> {
             TypeOperatorKind::NewProtocol(args) => {
                 match Self::synthesis_members(db, env, "NewProtocol", args)? {
                     SynthesisMembers::Deferred => defer(kind),
-                    SynthesisMembers::Dynamic => Ok(Type::any()),
+                    SynthesisMembers::Dynamic(dynamic) => Ok(dynamic),
                     SynthesisMembers::Members(members) => Ok(Type::protocol_from_members(
                         db,
                         env.program(db),
@@ -886,7 +1232,7 @@ impl<'db> TypeOperatorType<'db> {
             TypeOperatorKind::NewTypedDict(args) => {
                 match Self::synthesis_members(db, env, "NewTypedDict", args)? {
                     SynthesisMembers::Deferred => defer(kind),
-                    SynthesisMembers::Dynamic => Ok(Type::any()),
+                    SynthesisMembers::Dynamic(dynamic) => Ok(dynamic),
                     SynthesisMembers::Members(members) => {
                         let schema: TypedDictSchema<'db> = members
                             .into_iter()
@@ -912,67 +1258,172 @@ impl<'db> TypeOperatorType<'db> {
                     }
                 }
             }
+            TypeOperatorKind::GetArg(ty, base, index) => {
+                Self::evaluate_lifted(db, env, &kind, &[*ty, *base, *index], |args| {
+                    type_arguments::get_arg(db, env, args[0], args[1], Some(args[2]))
+                })
+            }
+            TypeOperatorKind::GetArgs(ty, base) => {
+                Self::evaluate_lifted(db, env, &kind, &[*ty, *base], |args| {
+                    type_arguments::get_arg(db, env, args[0], args[1], None)
+                })
+            }
+            TypeOperatorKind::Length(ty) => Self::evaluate_lifted(db, env, &kind, &[*ty], |args| {
+                type_arguments::length(db, env, args[0])
+            }),
+            TypeOperatorKind::Slice(sequence, start, end) => {
+                Self::evaluate_lifted(db, env, &kind, &[*sequence, *start, *end], |args| {
+                    type_arguments::slice(db, env, args[0], args[1], args[2])
+                })
+            }
+            TypeOperatorKind::GetSpecialAttr(ty, attribute) => {
+                Self::evaluate_lifted(db, env, &kind, &[*ty, *attribute], |args| {
+                    type_arguments::get_special_attr(db, env, args[0], args[1])
+                })
+            }
+            TypeOperatorKind::RaiseError { message, args } => {
+                Self::evaluate_raise_error(db, env, &kind, *message, args)
+            }
+            TypeOperatorKind::Quantifier { all, elements } => {
+                // `any` is the `or` of the elements, `all` their `and`. An unbounded part counts
+                // as one element.
+                let short_circuit = !*all;
+                let elements = match try_evaluate_sequence(db, env, *elements)? {
+                    Sequence::Fixed(elements) => elements,
+                    Sequence::Unbounded {
+                        mut prefix,
+                        element,
+                        suffix,
+                    } => {
+                        prefix.push(element);
+                        prefix.extend(suffix);
+                        prefix
+                    }
+                    Sequence::Dynamic(dynamic) => return Ok(dynamic),
+                    Sequence::Deferred => return defer(kind),
+                    Sequence::Error => {
+                        return Err(TypeOperatorError::new(format!(
+                            "Cannot iterate over `{}`",
+                            elements.display(db, env)
+                        )));
+                    }
+                };
+                Ok(evaluate_connective(db, env, &elements, short_circuit)
+                    .unwrap_or_else(|| Type::TypeOperator(TypeOperatorType::new(db, kind.clone()))))
+            }
         }
     }
 
-    /// Evaluate `and` (`short_circuit == false`) or `or` (`short_circuit == true`).
-    ///
-    /// Any operand equal to `short_circuit` decides the result, even if other operands are still
-    /// unresolved.
-    fn evaluate_connective(
+    /// Evaluates an operator whose arguments are all lifted over unions (PEP 827 "Basic
+    /// operators"). The operator is deferred while any argument contains unsolved type variables;
+    /// otherwise, for every combination, the first dynamic argument is the result, and `f`
+    /// evaluates the rest.
+    fn evaluate_lifted(
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         kind: &TypeOperatorKind<'db>,
-        operands: &[Type<'db>],
-        short_circuit: bool,
-    ) -> Type<'db> {
-        let mut deferred = false;
-        let mut dynamic = None;
-        let mut indeterminate = false;
-        let mut invalid = false;
+        args: &[Type<'db>],
+        f: impl Fn(&[Type<'db>]) -> Result<Type<'db>, type_arguments::EvaluationError>,
+    ) -> OperatorResult<'db> {
+        if args.iter().any(|arg| needs_deferral(db, env, *arg)) {
+            return Ok(Type::TypeOperator(TypeOperatorType::new(db, kind.clone())));
+        }
+        lift_over_unions(db, env, args, |args| {
+            if let Some(dynamic) = args.iter().find(|arg| arg.is_dynamic()) {
+                return Ok(*dynamic);
+            }
+            f(args).map_err(TypeOperatorError::new)
+        })
+    }
 
-        for operand in operands {
-            match TypeBoolValue::of(db, env, *operand) {
-                TypeBoolValue::Known(value) if value == short_circuit => {
-                    return type_bool(short_circuit);
-                }
-                TypeBoolValue::Known(_) => {}
-                TypeBoolValue::Indeterminate => indeterminate = true,
-                TypeBoolValue::Dynamic(ty) => dynamic = dynamic.or(Some(ty)),
-                TypeBoolValue::Deferred => deferred = true,
-                TypeBoolValue::NotABool => invalid = true,
+    /// Evaluate `RaiseError[message, *args]` to a raised error marker.
+    fn evaluate_raise_error(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        kind: &TypeOperatorKind<'db>,
+        message: Type<'db>,
+        args: &[VariadicArg<'db>],
+    ) -> OperatorResult<'db> {
+        let defer = || Ok(Type::TypeOperator(TypeOperatorType::new(db, kind.clone())));
+        if needs_deferral(db, env, message)
+            || args.iter().any(|arg| needs_deferral(db, env, arg.ty()))
+        {
+            return defer();
+        }
+        let message = message.resolve_type_alias(db);
+        let Some(text) = message.as_string_literal() else {
+            return Err(TypeOperatorError::new(format!(
+                "The message of `RaiseError` must be a string literal type, but got `{}`",
+                message.display(db, env)
+            )));
+        };
+
+        // The extra arguments are displayed after expanding aliases at their outermost level.
+        let display = |ty: Type<'db>| ty.resolve_type_alias(db).display(db, env).to_string();
+        let mut parts = Vec::with_capacity(args.len());
+        for arg in args {
+            match *arg {
+                VariadicArg::Single(ty) => parts.push(display(ty)),
+                VariadicArg::Unpacked(ty) => match try_evaluate_sequence(db, env, ty) {
+                    Ok(Sequence::Fixed(elements)) => {
+                        parts.extend(elements.into_iter().map(display))
+                    }
+                    Ok(Sequence::Deferred) => return defer(),
+                    Ok(Sequence::Unbounded { .. } | Sequence::Dynamic(_) | Sequence::Error)
+                    | Err(_) => parts.push(format!("*{}", display(ty))),
+                },
             }
         }
 
-        if invalid {
-            Type::unknown()
-        } else if deferred {
-            Type::TypeOperator(TypeOperatorType::new(db, kind.clone()))
-        } else if let Some(dynamic) = dynamic {
-            dynamic
-        } else if indeterminate {
-            KnownClass::Bool.to_instance(db, env)
-        } else {
-            type_bool(!short_circuit)
+        let mut message = text.value(db).to_string();
+        if !parts.is_empty() {
+            message.push_str(": ");
+            message.push_str(&parts.join(", "));
         }
+        Ok(Type::Dynamic(DynamicType::RaisedError(
+            RaisedErrorType::new(db, message.into_boxed_str()),
+        )))
     }
 
     /// Evaluate `*[body for binder in Iter[iterable] if c1 if c2 ...]` to a tuple of the body
     /// evaluated for every element that satisfies all conditions.
+    ///
+    /// The fixed elements of the iterable are mapped one by one. The unbounded part of an
+    /// unbounded iterable is mapped once, with its element type: it is kept as an unbounded part
+    /// of the result if the element passes the conditions, and dropped otherwise.
     fn evaluate_unpack_map(
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         kind: &TypeOperatorKind<'db>,
         iterable: Type<'db>,
         binder: BoundTypeVarInstance<'db>,
-        body: Type<'db>,
+        body: VariadicArg<'db>,
         conditions: &[Type<'db>],
     ) -> OperatorResult<'db> {
+        /// The result of mapping one element of the iterable.
+        enum Mapped<'db> {
+            Skipped,
+            Kept(Type<'db>),
+            Deferred,
+            Raised(Type<'db>),
+        }
+
         let defer = || Ok(Type::TypeOperator(TypeOperatorType::new(db, kind.clone())));
 
-        let elements = match try_evaluate_sequence(db, env, iterable)? {
-            Sequence::Fixed(elements) => elements,
-            Sequence::Dynamic => return Ok(Type::homogeneous_tuple(db, env, Type::any())),
+        let (prefix, unbounded, suffix) = match try_evaluate_sequence(db, env, iterable)? {
+            Sequence::Fixed(elements) => (elements, None, Vec::new()),
+            Sequence::Unbounded {
+                prefix,
+                element,
+                suffix,
+            } => (prefix, Some(element), suffix),
+            Sequence::Dynamic(dynamic) => {
+                return Ok(if as_raised_error(db, dynamic).is_some() {
+                    dynamic
+                } else {
+                    Type::homogeneous_tuple(db, env, dynamic)
+                });
+            }
             Sequence::Deferred => return defer(),
             Sequence::Error => {
                 return Err(TypeOperatorError::new(format!(
@@ -982,26 +1433,76 @@ impl<'db> TypeOperatorType<'db> {
             }
         };
 
-        let mut results = Vec::with_capacity(elements.len());
-        'elements: for element in elements {
+        let map_element = |element: Type<'db>| {
             for condition in conditions {
                 let condition = condition.substitute_one_typevar(db, env, binder, element);
                 match TypeBoolValue::of(db, env, condition) {
                     TypeBoolValue::Known(true) => {}
-                    TypeBoolValue::Deferred => return defer(),
+                    TypeBoolValue::Deferred => return Mapped::Deferred,
+                    // Skipping the element would lose the error.
+                    TypeBoolValue::Raised(raised) => return Mapped::Raised(raised),
                     TypeBoolValue::Known(false)
                     | TypeBoolValue::Indeterminate
                     | TypeBoolValue::Dynamic(_)
-                    | TypeBoolValue::NotABool => continue 'elements,
+                    | TypeBoolValue::NotABool => return Mapped::Skipped,
                 }
             }
-            let result = body.substitute_one_typevar(db, env, binder, element);
+            let result = body.ty().substitute_one_typevar(db, env, binder, element);
             if needs_deferral(db, env, result) {
-                return defer();
+                Mapped::Deferred
+            } else {
+                Mapped::Kept(result)
             }
-            results.push(result);
+        };
+
+        // Maps one fixed element and splices the result onto `builder`.
+        let add_fixed = |mut builder: TupleSpecBuilder<'db>, element: Type<'db>| {
+            let result = match map_element(element) {
+                Mapped::Skipped => return Ok(Spliced::Done(builder)),
+                Mapped::Kept(result) => result,
+                Mapped::Deferred => return Ok(Spliced::Deferred),
+                Mapped::Raised(raised) => return Ok(Spliced::Raised(raised)),
+            };
+            match body {
+                VariadicArg::Single(_) => {
+                    builder.push(result);
+                    Ok(Spliced::Done(builder))
+                }
+                VariadicArg::Unpacked(_) => concat_unpacked(db, env, builder, result, "tuple"),
+            }
+        };
+
+        let mut builder = TupleSpecBuilder::with_capacity(prefix.len() + suffix.len());
+        for element in prefix {
+            match add_fixed(builder, element)? {
+                Spliced::Done(next) => builder = next,
+                Spliced::Deferred => return defer(),
+                Spliced::Raised(raised) => return Ok(raised),
+            }
         }
-        Ok(Type::heterogeneous_tuple(db, env, results))
+        if let Some(element) = unbounded {
+            match map_element(element) {
+                Mapped::Skipped => {}
+                Mapped::Kept(result) => {
+                    if matches!(body, VariadicArg::Unpacked(_)) {
+                        return Err(TypeOperatorError::new(
+                            "Each element of an unbounded tuple must map to exactly one type",
+                        ));
+                    }
+                    builder = builder.concat(db, env, &TupleSpec::homogeneous(result));
+                }
+                Mapped::Deferred => return defer(),
+                Mapped::Raised(raised) => return Ok(raised),
+            }
+        }
+        for element in suffix {
+            match add_fixed(builder, element)? {
+                Spliced::Done(next) => builder = next,
+                Spliced::Deferred => return defer(),
+                Spliced::Raised(raised) => return Ok(raised),
+            }
+        }
+        Ok(Type::tuple(TupleType::new(db, env, &builder.build())))
     }
 
     /// Evaluate `tuple[...]` with unpacked arguments.
@@ -1016,36 +1517,12 @@ impl<'db> TypeOperatorType<'db> {
             match *arg {
                 VariadicArg::Single(ty) => builder.push(ty),
                 VariadicArg::Unpacked(ty) => {
-                    let resolved = ty.resolve_type_alias(db);
-                    if let Some(spec) = resolved.exact_tuple_instance_spec(db) {
-                        builder = builder.concat(db, env, &spec);
-                    } else if let Type::TypeVar(typevar) = resolved
-                        && typevar.is_typevartuple(db)
-                    {
-                        builder = builder.concat_variadic_typevar(db, env, typevar);
-                    } else {
-                        match try_evaluate_sequence(db, env, resolved)? {
-                            Sequence::Fixed(elements) => {
-                                builder =
-                                    builder.concat(db, env, &TupleSpec::heterogeneous(elements));
-                            }
-                            Sequence::Dynamic => {
-                                builder =
-                                    builder.concat(db, env, &TupleSpec::homogeneous(Type::any()));
-                            }
-                            Sequence::Deferred => {
-                                return Ok(Type::TypeOperator(TypeOperatorType::new(
-                                    db,
-                                    kind.clone(),
-                                )));
-                            }
-                            Sequence::Error => {
-                                return Err(TypeOperatorError::new(format!(
-                                    "Cannot unpack `{}` in `tuple`",
-                                    ty.display(db, env)
-                                )));
-                            }
+                    match concat_unpacked(db, env, builder, ty, "tuple")? {
+                        Spliced::Done(next) => builder = next,
+                        Spliced::Deferred => {
+                            return Ok(Type::TypeOperator(TypeOperatorType::new(db, kind.clone())));
                         }
+                        Spliced::Raised(raised) => return Ok(raised),
                     }
                 }
             }
@@ -1053,7 +1530,8 @@ impl<'db> TypeOperatorType<'db> {
         Ok(Type::tuple(TupleType::new(db, env, &builder.build())))
     }
 
-    /// Evaluate `Union[...]` with unpacked arguments.
+    /// Evaluate `Union[...]` with unpacked arguments. All element types of an unpacked
+    /// unbounded tuple, including the one of its unbounded part, end up in the union.
     fn evaluate_union_of(
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
@@ -1061,7 +1539,7 @@ impl<'db> TypeOperatorType<'db> {
         args: &[VariadicArg<'db>],
     ) -> OperatorResult<'db> {
         let mut builder = UnionBuilder::new(db, env);
-        let mut dynamic = false;
+        let mut dynamic = None;
         for arg in args {
             match *arg {
                 VariadicArg::Single(ty) => builder = builder.add(ty),
@@ -1071,7 +1549,17 @@ impl<'db> TypeOperatorType<'db> {
                             builder = builder.add(element);
                         }
                     }
-                    Sequence::Dynamic => dynamic = true,
+                    Sequence::Unbounded {
+                        prefix,
+                        element,
+                        suffix,
+                    } => {
+                        for element in prefix.into_iter().chain([element]).chain(suffix) {
+                            builder = builder.add(element);
+                        }
+                    }
+                    Sequence::Dynamic(ty) if as_raised_error(db, ty).is_some() => return Ok(ty),
+                    Sequence::Dynamic(ty) => dynamic = dynamic.or(Some(ty)),
                     Sequence::Deferred => {
                         return Ok(Type::TypeOperator(TypeOperatorType::new(db, kind.clone())));
                     }
@@ -1084,11 +1572,7 @@ impl<'db> TypeOperatorType<'db> {
                 },
             }
         }
-        if dynamic {
-            Ok(Type::any())
-        } else {
-            Ok(builder.build())
-        }
+        Ok(dynamic.unwrap_or_else(|| builder.build()))
     }
 
     /// Collects the `Member`s passed to `NewProtocol`/`NewTypedDict`.
@@ -1104,7 +1588,17 @@ impl<'db> TypeOperatorType<'db> {
                 VariadicArg::Single(ty) => member_types.push(ty),
                 VariadicArg::Unpacked(ty) => match try_evaluate_sequence(db, env, ty)? {
                     Sequence::Fixed(elements) => member_types.extend(elements),
-                    Sequence::Dynamic => return Ok(SynthesisMembers::Dynamic),
+                    Sequence::Unbounded { .. } => {
+                        let what = if operator_name == "NewProtocol" {
+                            "a protocol"
+                        } else {
+                            "a TypedDict"
+                        };
+                        return Err(TypeOperatorError::new(format!(
+                            "Cannot create {what} from an unbounded number of members"
+                        )));
+                    }
+                    Sequence::Dynamic(dynamic) => return Ok(SynthesisMembers::Dynamic(dynamic)),
                     Sequence::Deferred => return Ok(SynthesisMembers::Deferred),
                     Sequence::Error => {
                         return Err(TypeOperatorError::new(format!(
@@ -1117,11 +1611,14 @@ impl<'db> TypeOperatorType<'db> {
         }
 
         let mut members = Vec::with_capacity(member_types.len());
-        let mut dynamic = false;
+        let mut dynamic = None;
         for member_type in member_types {
             let resolved = member_type.resolve_type_alias(db);
             if resolved.is_dynamic() {
-                dynamic = true;
+                if as_raised_error(db, resolved).is_some() {
+                    return Ok(SynthesisMembers::Dynamic(resolved));
+                }
+                dynamic = dynamic.or(Some(resolved));
                 continue;
             }
             let Some([name, ty, quals, _, _]) = member_args(db, env, resolved) else {
@@ -1156,11 +1653,10 @@ impl<'db> TypeOperatorType<'db> {
             });
         }
 
-        if dynamic {
-            Ok(SynthesisMembers::Dynamic)
-        } else {
-            Ok(SynthesisMembers::Members(members))
-        }
+        Ok(match dynamic {
+            Some(dynamic) => SynthesisMembers::Dynamic(dynamic),
+            None => SynthesisMembers::Members(members),
+        })
     }
 
     /// The narrowest type that every possible evaluation of this operator is assignable to.
@@ -1176,22 +1672,33 @@ impl<'db> TypeOperatorType<'db> {
             | TypeOperatorKind::Bool(_)
             | TypeOperatorKind::Not(_)
             | TypeOperatorKind::And(_)
-            | TypeOperatorKind::Or(_) => KnownClass::Bool.to_instance(db, env),
+            | TypeOperatorKind::Or(_)
+            | TypeOperatorKind::Quantifier { .. } => KnownClass::Bool.to_instance(db, env),
             TypeOperatorKind::Attrs(_)
             | TypeOperatorKind::Members(_)
             | TypeOperatorKind::FromUnion(_)
             | TypeOperatorKind::UnpackMap { .. }
-            | TypeOperatorKind::TupleOf(_) => Type::homogeneous_tuple(db, env, Type::any()),
+            | TypeOperatorKind::TupleOf(_)
+            | TypeOperatorKind::GetArgs(..)
+            | TypeOperatorKind::Slice(..) => Type::homogeneous_tuple(db, env, Type::any()),
             TypeOperatorKind::GetMember(..) => member_instance(db, env, [Type::any(); 5]),
-            TypeOperatorKind::MemberAccess(_, MemberField::Name) => {
-                KnownClass::Str.to_instance(db, env)
-            }
+            TypeOperatorKind::MemberAccess(_, MemberField::Name)
+            | TypeOperatorKind::GetSpecialAttr(..) => KnownClass::Str.to_instance(db, env),
             TypeOperatorKind::MemberAccess(_, MemberField::Quals) => all_qualifiers_type(db, env),
+            TypeOperatorKind::Length(_) => UnionType::from_two_elements(
+                db,
+                env,
+                KnownClass::Int.to_instance(db, env),
+                Type::none(db, env),
+            ),
+            // Once evaluated, `RaiseError` is a dynamic type.
+            TypeOperatorKind::RaiseError { .. } => Type::unknown(),
             TypeOperatorKind::MemberAccess(..)
             | TypeOperatorKind::GetMemberType(..)
             | TypeOperatorKind::UnionOf(_)
             | TypeOperatorKind::NewProtocol(_)
-            | TypeOperatorKind::NewTypedDict(_) => Type::object(),
+            | TypeOperatorKind::NewTypedDict(_)
+            | TypeOperatorKind::GetArg(..) => Type::object(),
         }
     }
 
@@ -1203,6 +1710,8 @@ impl<'db> TypeOperatorType<'db> {
             TypeOperatorKind::Conditional {
                 if_true, if_false, ..
             } => IntersectionType::from_two_elements(db, env, *if_true, *if_false),
+            // Once evaluated, `RaiseError` is a dynamic type.
+            TypeOperatorKind::RaiseError { .. } => Type::unknown(),
             _ => Type::Never,
         }
     }
@@ -1224,15 +1733,16 @@ impl<'db> TypeOperatorType<'db> {
         visitor: &ApplyTypeMappingVisitor<'_, 'db>,
     ) -> Type<'db> {
         visitor.visit(db, Type::TypeOperator(self), type_mapping, || {
+            let env = visitor.env;
             let maps_inputs = !matches!(
                 type_mapping,
                 TypeMapping::Materialize(_) | TypeMapping::Promote(PromotionMode::On, _)
             );
             let map = |ty: Type<'db>, role: OperandRole| match role {
-                OperandRole::Input if maps_inputs => {
+                OperandRole::Input | OperandRole::CovariantInput if maps_inputs => {
                     ty.apply_type_mapping_impl(db, type_mapping, TypeContext::default(), visitor)
                 }
-                OperandRole::Input => ty,
+                OperandRole::Input | OperandRole::CovariantInput => ty,
                 OperandRole::Output => ty.apply_type_mapping_impl(db, type_mapping, tcx, visitor),
             };
 
@@ -1256,11 +1766,80 @@ impl<'db> TypeOperatorType<'db> {
                         conditions: conditions.clone(),
                     }
                 }
+                // Only the branch selected by the mapped condition is mapped, so that a
+                // recursive alias stops expanding at its base case.
+                TypeOperatorKind::Conditional {
+                    condition,
+                    if_true,
+                    if_false,
+                } => {
+                    let condition = map(*condition, OperandRole::Input);
+                    match TypeBoolValue::of(db, env, condition) {
+                        TypeBoolValue::Known(true) => return map(*if_true, OperandRole::Output),
+                        TypeBoolValue::Known(false)
+                        | TypeBoolValue::Indeterminate
+                        | TypeBoolValue::NotABool => return map(*if_false, OperandRole::Output),
+                        TypeBoolValue::Raised(raised) => return raised,
+                        TypeBoolValue::Dynamic(_) => {
+                            return UnionType::from_two_elements(
+                                db,
+                                env,
+                                map(*if_true, OperandRole::Output),
+                                map(*if_false, OperandRole::Output),
+                            );
+                        }
+                        TypeBoolValue::Deferred => TypeOperatorKind::Conditional {
+                            condition,
+                            if_true: map(*if_true, OperandRole::Output),
+                            if_false: map(*if_false, OperandRole::Output),
+                        },
+                    }
+                }
+                // Operands are mapped from left to right until one decides the result.
+                TypeOperatorKind::And(operands) | TypeOperatorKind::Or(operands) => {
+                    let short_circuit = matches!(self.kind(db), TypeOperatorKind::Or(_));
+                    let mut mapped = Vec::with_capacity(operands.len());
+                    for operand in operands {
+                        let operand = map(*operand, OperandRole::Input);
+                        if matches!(
+                            TypeBoolValue::of(db, env, operand),
+                            TypeBoolValue::Known(value) if value == short_circuit
+                        ) {
+                            return type_bool(short_circuit);
+                        }
+                        mapped.push(operand);
+                    }
+                    if short_circuit {
+                        TypeOperatorKind::Or(mapped.into_boxed_slice())
+                    } else {
+                        TypeOperatorKind::And(mapped.into_boxed_slice())
+                    }
+                }
                 kind => kind
                     .try_map(|ty, role| Some(map(ty, role)))
                     .expect("infallible mapping"),
             };
-            Self::evaluate_or_defer(db, visitor.env, kind)
+            // An unpacked operator that failed during this evaluation (and so became `Unknown`)
+            // makes the enclosing variadic result `Unknown`, as a failed unpacked comprehension
+            // does when it is evaluated in place.
+            if let (
+                TypeOperatorKind::TupleOf(before)
+                | TypeOperatorKind::UnionOf(before)
+                | TypeOperatorKind::NewProtocol(before)
+                | TypeOperatorKind::NewTypedDict(before),
+                TypeOperatorKind::TupleOf(after)
+                | TypeOperatorKind::UnionOf(after)
+                | TypeOperatorKind::NewProtocol(after)
+                | TypeOperatorKind::NewTypedDict(after),
+            ) = (self.kind(db), &kind)
+                && before.iter().zip(after.iter()).any(|(before, after)| {
+                    matches!(before, VariadicArg::Unpacked(Type::TypeOperator(_)))
+                        && after.ty().is_unknown()
+                })
+            {
+                return Type::unknown();
+            }
+            Self::evaluate_or_defer(db, env, kind)
         })
     }
 
@@ -1321,7 +1900,9 @@ impl<'db> VarianceInferable<'db> for TypeOperatorType<'db> {
                 OperandRole::Input => ty
                     .with_polarity(TypeVarVariance::Invariant)
                     .variance_of(db, env, typevar),
-                OperandRole::Output => ty.variance_of(db, env, typevar),
+                OperandRole::CovariantInput | OperandRole::Output => {
+                    ty.variance_of(db, env, typevar)
+                }
             });
         });
         VarianceTerm::join(db, terms)

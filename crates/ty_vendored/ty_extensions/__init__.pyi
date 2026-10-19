@@ -101,16 +101,20 @@ This allows a type alias whose value is a type boolean to be used where a type b
 
 Iter: _SpecialForm
 """
-`Iter[T]` is an experimental [PEP 827] form that iterates over the elements of the fixed-length
-tuple type `T`. It may only appear as the iterable of the `for` clause of an unpacked list
-comprehension in a variadic position of a type expression:
+`Iter[T]` is an experimental [PEP 827] form that iterates over the elements of the tuple type `T`.
+It may only appear as the iterable of a `for` clause of an unpacked list comprehension in a
+variadic position of a type expression, or of a generator passed to `any()` or `all()` in a type
+boolean:
 
 ```python
 type Names[T] = tuple[*[m.name for m in Iter[Attrs[T]]]]
+type Pairs[A, B] = tuple[*[tuple[a, b] for a in Iter[A] for b in Iter[B]]]
+type AllInts[T] = all(IsAssignable[t, int] for t in Iter[T])
 ```
 
 Iterating over `Never` produces no elements; iterating over `Any` produces an unknown number of
-`Any` elements.
+`Any` elements. The unbounded part of a tuple such as `tuple[int, *tuple[str, ...]]` is mapped
+once, and stays unbounded in the result.
 
 [PEP 827]: https://peps.python.org/pep-0827/
 """
@@ -175,6 +179,72 @@ NewTypedDict: _SpecialForm
 """
 `NewTypedDict[*Ms]` is an experimental [PEP 827] operator: a new `TypedDict` type with the items
 described by the `Member` types `Ms`. The `NotRequired` and `ReadOnly` qualifiers are respected.
+
+[PEP 827]: https://peps.python.org/pep-0827/
+"""
+
+GetArg: _SpecialForm
+"""
+`GetArg[T, Base, Idx]` is an experimental [PEP 827] operator: the type argument at index `Idx` (an
+`int` literal type, negative indexes count from the end) of `T` viewed as an instance of the class
+`Base`. The base classes of `T` are searched, so for `class A(B[C])`, `GetArg[A, B, Literal[0]]` is
+`C`. `Base` can also be `tuple` (the elements of a tuple), `type` (the class of `type[C]`) or
+`Callable` (index `-1` is the return type). Unions are distributed over.
+
+```python
+type ElemOf[T] = GetArg[T, Iterable, Literal[0]]
+```
+
+[PEP 827]: https://peps.python.org/pep-0827/
+"""
+
+GetArgs: _SpecialForm
+"""
+`GetArgs[T, Base]` is an experimental [PEP 827] operator: a tuple of all type arguments of `T`
+viewed as an instance of the class `Base` (see `GetArg`). Unions are distributed over.
+
+[PEP 827]: https://peps.python.org/pep-0827/
+"""
+
+Length: _SpecialForm
+"""
+`Length[T]` is an experimental [PEP 827] operator: the length of the tuple type `T` as an `int`
+literal type, or `None` if `T` has an unbounded part. Unions are distributed over.
+
+[PEP 827]: https://peps.python.org/pep-0827/
+"""
+
+Slice: _SpecialForm
+"""
+`Slice[S, Start, End]` is an experimental [PEP 827] operator: the slice `S[Start:End]` of the tuple
+type `S`, where `Start` and `End` are `int` literal types or `None`. Unions are distributed over.
+
+```python
+type DropLast[T] = Slice[T, Literal[0], Literal[-1]]
+```
+
+[PEP 827]: https://peps.python.org/pep-0827/
+"""
+
+GetSpecialAttr: _SpecialForm
+"""
+`GetSpecialAttr[T, Attr]` is an experimental [PEP 827] operator: the value of the special attribute
+`Attr` (`Literal["__name__"]`, `Literal["__module__"]` or `Literal["__qualname__"]`) of the class
+of `T`, as a string literal type. Unions are distributed over.
+
+[PEP 827]: https://peps.python.org/pep-0827/
+"""
+
+RaiseError: _SpecialForm
+"""
+`RaiseError[S, *Ts]` is an experimental [PEP 827] operator that reports the type error `S` (a string
+literal type), followed by the types `Ts`, when it is evaluated where a type is used (for example
+in an annotation, or in the return type of a call). It evaluates to `Any`. It is not reported in a
+branch of a conditional type that is not taken.
+
+```python
+type OnlyInts[T] = T if IsAssignable[T, int] else RaiseError[Literal["expected an int"], T]
+```
 
 [PEP 827]: https://peps.python.org/pep-0827/
 """

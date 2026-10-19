@@ -74,7 +74,8 @@ impl<'db> ClassBase<'db> {
                 | DynamicType::UnknownGeneric(_)
                 | DynamicType::UnknownLambdaParameter
                 | DynamicType::InvalidConcatenateUnknown
-                | DynamicType::AmbiguousOverload,
+                | DynamicType::AmbiguousOverload
+                | DynamicType::RaisedError(_),
             ) => "Unknown",
             ClassBase::Dynamic(DynamicType::UnspecializedTypeVar) => "UnspecializedTypeVar",
             ClassBase::Dynamic(DynamicType::Todo(_)) => "@Todo",
@@ -315,6 +316,12 @@ impl<'db> ClassBase<'db> {
                 | SpecialFormType::NewProtocol
                 | SpecialFormType::NewTypedDict
                 | SpecialFormType::FromUnion
+                | SpecialFormType::GetArg
+                | SpecialFormType::GetArgs
+                | SpecialFormType::Length
+                | SpecialFormType::Slice
+                | SpecialFormType::GetSpecialAttr
+                | SpecialFormType::RaiseError
                 | SpecialFormType::TypeOf
                 | SpecialFormType::CallableTypeOf
                 | SpecialFormType::RegularCallableTypeOf

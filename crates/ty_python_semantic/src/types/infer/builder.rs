@@ -86,9 +86,9 @@ use crate::types::diagnostic::{
     report_match_pattern_against_non_runtime_checkable_protocol,
     report_match_pattern_against_typed_dict, report_mismatched_type_name,
     report_possibly_missing_attribute, report_possibly_unresolved_reference,
-    report_too_many_positional_patterns_for_class_pattern, report_undefined_reveal,
-    report_unsound_assignment, report_unsound_yield, report_unsupported_augmented_assignment,
-    report_unsupported_comparison,
+    report_raised_type_errors_except, report_too_many_positional_patterns_for_class_pattern,
+    report_undefined_reveal, report_unsound_assignment, report_unsound_yield,
+    report_unsupported_augmented_assignment, report_unsupported_comparison,
 };
 use crate::types::dict::dict_literal_key_value_types;
 use crate::types::enums::{enum_ignored_names, is_enum_class_by_inheritance};
@@ -119,6 +119,7 @@ use crate::types::subclass_of::SubclassOfInner;
 use crate::types::tuple::promotion::TupleSizePromotionConstraints;
 use crate::types::tuple::{Tuple, TupleLength, TupleSpecBuilder, TupleType, VariableSegment};
 use crate::types::type_alias::{ManualPEP695TypeAliasType, PEP695TypeAliasType};
+use crate::types::type_operator::find_raised_errors;
 use crate::types::typed_dict::{TypedDictAssignmentKind, TypedDictKeyAssignment};
 use crate::types::typevar::{
     BoundTypeVarIdentity, TypeVarConstraints, TypeVarIdentity, TypeVarInstance, TypeVarSet,
@@ -4881,6 +4882,16 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 // Alias type inference emits the diagnostic, but this runtime value is
                 // retained as the alias binding.
                 match inferred_ty {
+                    // A PEP 827 quantifier is not supported in a value-indexed position; alias
+                    // inference reports it, and the alias is `Unknown` (not the runtime `bool`).
+                    _ if matches!(
+                        value,
+                        ast::Expr::Call(call)
+                            if type_operator::type_quantifier_generator(call).is_some()
+                    ) =>
+                    {
+                        Type::unknown()
+                    }
                     Type::SpecialForm(SpecialFormType::TypingSelf) => {
                         self.expressions.insert(value.into(), Type::unknown());
                         Type::unknown()
@@ -10052,6 +10063,17 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             }
             _ => return_ty,
         };
+
+        // A PEP 827 `RaiseError` selected by the specialization of the return type is reported at
+        // the call (unless it only passes through an error in the type of an argument).
+        report_raised_type_errors_except(&self.context, call_expression, return_ty, || {
+            arguments
+                .iter_source_order()
+                .flat_map(|argument| {
+                    find_raised_errors(db, env, self.expression_type(argument.value()))
+                })
+                .collect()
+        });
 
         typeguard::bind_type_guard_return_type(db, self.scope(), return_ty, &bindings, arguments)
     }

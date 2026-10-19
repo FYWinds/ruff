@@ -104,7 +104,7 @@ use crate::types::special_form::TypeQualifier;
 use crate::types::tuple::TupleSpec;
 pub use crate::types::type_alias::TypeAliasType;
 pub use crate::types::type_form::TypeFormType;
-pub use crate::types::type_operator::TypeOperatorType;
+pub use crate::types::type_operator::{RaisedErrorType, TypeOperatorType};
 pub(crate) use crate::types::typed_dict::TypedDictType;
 pub(crate) use crate::types::typevar::{
     BindingContext, BoundTypeVarIdentity, ParamSpecAttrKind, TypeVarBoundOrConstraints,
@@ -181,6 +181,7 @@ mod subclass_of;
 pub(crate) mod tests;
 mod tuple;
 mod type_alias;
+mod type_arguments;
 mod type_expansion;
 mod type_form;
 mod type_operator;
@@ -2580,7 +2581,8 @@ impl<'db> Type<'db> {
             | DynamicType::UnknownGeneric(_)
             | DynamicType::UnspecializedTypeVar
             | DynamicType::UnknownLambdaParameter
-            | DynamicType::AmbiguousOverload => false,
+            | DynamicType::AmbiguousOverload
+            | DynamicType::RaisedError(_) => false,
             DynamicType::Todo(_) => true,
         })
     }
@@ -3457,7 +3459,8 @@ impl<'db> Type<'db> {
                 | DynamicType::UnknownLambdaParameter
                 | DynamicType::Todo(_)
                 | DynamicType::InvalidConcatenateUnknown
-                | DynamicType::AmbiguousOverload => false,
+                | DynamicType::AmbiguousOverload
+                | DynamicType::RaisedError(_) => false,
             },
         }
     }
@@ -10559,7 +10562,8 @@ impl<'db> Type<'db> {
                 DynamicType::Unknown
                 | DynamicType::UnknownGeneric(_)
                 | DynamicType::UnknownLambdaParameter
-                | DynamicType::AmbiguousOverload,
+                | DynamicType::AmbiguousOverload
+                | DynamicType::RaisedError(_),
             ) => Type::SpecialForm(SpecialFormType::Unknown).definition(db, env),
             Self::Divergent(_) => Type::SpecialForm(SpecialFormType::Divergent).definition(db, env),
             Self::Dynamic(DynamicType::Todo(_)) => {
@@ -11481,6 +11485,10 @@ pub enum DynamicType<'db> {
     ///
     /// This variant should be created with the `todo_type!` macro.
     Todo(TodoType),
+    /// The result of evaluating a PEP 827 `RaiseError[...]` operator. Behaves like `Any` in
+    /// type relations and displays as `Unknown`; the error is reported where the type is used
+    /// (see `report_raised_type_errors`). Not [`Type::is_unknown`].
+    RaisedError(RaisedErrorType<'db>),
 }
 
 impl DynamicType<'_> {
@@ -11508,7 +11516,8 @@ impl std::fmt::Display for DynamicType<'_> {
             | DynamicType::UnknownGeneric(_)
             | DynamicType::UnknownLambdaParameter
             | DynamicType::InvalidConcatenateUnknown
-            | DynamicType::AmbiguousOverload => f.write_str("Unknown"),
+            | DynamicType::AmbiguousOverload
+            | DynamicType::RaisedError(_) => f.write_str("Unknown"),
             DynamicType::UnspecializedTypeVar => f.write_str("UnspecializedTypeVar"),
             // `DynamicType::Todo`'s display should be explicit that is not a valid display of
             // any other type

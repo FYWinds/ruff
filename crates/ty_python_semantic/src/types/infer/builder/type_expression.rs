@@ -10,7 +10,7 @@ use ruff_python_ast::{self as ast, PythonVersion};
 use ruff_source_file::LineRanges;
 use ruff_text_size::{Ranged, TextRange};
 
-use super::type_operator::is_type_bool_operand_syntax;
+use super::type_operator::{is_type_bool_operand_syntax, type_quantifier_generator};
 use super::{DeferredExpressionState, TypeInferenceBuilder};
 use crate::types::call::CallArguments;
 use crate::types::definition_resolution::{ImportAliasResolution, resolve_definition};
@@ -18,7 +18,7 @@ use crate::types::diagnostic::{
     self, CYCLIC_TYPE_ALIAS_DEFINITION, EXPERIMENTAL_SYNTAX, INVALID_INIT_TYPE_VARIABLE,
     INVALID_TYPE_FORM, NOT_SUBSCRIPTABLE, UNBOUND_TYPE_VARIABLE, UNSUPPORTED_OPERATOR,
     report_invalid_argument_number_to_special_form, report_invalid_arguments_to_callable,
-    report_invalid_concatenate_last_arg, report_missing_type_arguments,
+    report_invalid_concatenate_last_arg, report_missing_type_arguments, report_raised_type_errors,
     report_unsupported_binary_operation,
 };
 use crate::types::infer::builder::subscript::AnnotatedExprContext;
@@ -30,7 +30,7 @@ use crate::types::signatures::{ConcatenateTail, Signature};
 use crate::types::special_form::{AliasSpec, LegacyStdlibAlias};
 use crate::types::string_annotation::parse_string_annotation;
 use crate::types::tuple::{TupleSpec, TupleSpecBuilder, TupleType};
-use crate::types::type_operator::{TypeOperatorKind, VariadicArg};
+use crate::types::type_operator::{TypeOperatorKind, VariadicArg, is_unresolved_alias};
 use ty_python_core::definition::{Definition, DefinitionKind};
 use ty_python_core::place_table;
 use ty_python_core::scope::ScopeKind;
@@ -210,6 +210,18 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             InferenceFlags::IN_TYPE_EXPRESSION,
             previously_in_type_expression,
         );
+        // PEP 827 `RaiseError`s are reported where a type is used: at the outermost type
+        // expression (but not in the value of a type alias, which is checked where it is used).
+        // A string annotation is checked through its parsed expression.
+        if !was_in_type_expression
+            && !was_in_nested_type_expression
+            && !expression.is_string_literal_expr()
+            && !self
+                .inference_flags()
+                .contains(InferenceFlags::IN_TYPE_ALIAS)
+        {
+            report_raised_type_errors(&self.context, expression, ty);
+        }
         self.store_expression_type(expression, ty);
         ty
     }
@@ -313,6 +325,9 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             builder.deferred_state.is_deferred()
                 || builder.in_stub()
                 || builder.is_in_type_checking_block(builder.scope(), expression)
+                // The loop variables of a PEP 827 type comprehension have no runtime value that
+                // could be checked here.
+                || !builder.type_binders.is_empty()
         };
         let ignore_experimental_runtime_errors = |builder: &Self| {
             ignore_runtime_errors(builder)
@@ -1216,6 +1231,12 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             }
 
             ast::Expr::Call(call_expr) => {
+                // The semantic index gives the generator of a quantifier-shaped call no scope of
+                // its own in a type expression, so it must be inferred as a quantifier in every
+                // type-expression position.
+                if let Some(generator) = type_quantifier_generator(call_expr) {
+                    return self.infer_type_quantifier(call_expr, generator);
+                }
                 if !self.in_string_annotation() {
                     self.infer_call_expression(call_expr, TypeContext::default());
                 }
@@ -1316,7 +1337,16 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 .context
                 .inference_flags
                 .replace(InferenceFlags::IN_UNPACK_TYPE_ARGUMENT, true);
-            let ty = self.infer_type_expression(value).resolve_type_alias(db);
+            let ty = self.infer_type_expression(value);
+            // An alias with type operators specialized with unsolved type variables (such as the
+            // recursive reference in `type Zip[T, S] = ... tuple[*Zip[DropLast[T], DropLast[S]],
+            // ...]`) must not be resolved here: resolving it while its own value is being
+            // inferred diverges. It is kept as a deferred sequence instead.
+            let ty = if is_unresolved_alias(db, self.program_environment(), ty) {
+                ty
+            } else {
+                ty.resolve_type_alias(db)
+            };
             self.context.inference_flags.set(
                 InferenceFlags::IN_UNPACK_TYPE_ARGUMENT,
                 previously_in_unpack_type_argument,
@@ -1324,12 +1354,16 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             ty
         };
 
-        if starred_type.exact_tuple_instance_spec(self.db()).is_some()
+        if is_unresolved_alias(db, self.program_environment(), starred_type)
+            || starred_type.exact_tuple_instance_spec(self.db()).is_some()
             || matches!(
                 starred_type,
                 Type::TypeVar(typevar) if typevar.is_typevartuple(self.db())
             )
             || self.is_unpackable_type_operator(starred_type)
+            // Unpacking a sequence that raised a PEP 827 `RaiseError` raises it, too; the
+            // enclosing variadic position becomes the error.
+            || matches!(starred_type, Type::Dynamic(DynamicType::RaisedError(_)))
         {
             starred_type
         } else {
@@ -1525,6 +1559,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 let mut variadic_arguments = Vec::with_capacity(elements.len());
                 let mut unpacks_type_operator = false;
                 let mut unpacks_failed_comprehension = false;
+                let mut raised_error = None;
 
                 let mut first_unpacked_variadic_tuple = None;
 
@@ -1591,7 +1626,11 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                             }
                         };
 
-                        if let Some(inner_tuple) = element_ty.exact_tuple_instance_spec(self.db()) {
+                        if is_unresolved_alias(db, env, element_ty) {
+                            unpacks_type_operator = true;
+                        } else if let Some(inner_tuple) =
+                            element_ty.exact_tuple_instance_spec(self.db())
+                        {
                             element_types = element_types.concat(db, env, &inner_tuple);
 
                             if inner_tuple.is_variadic() {
@@ -1602,10 +1641,12 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                         {
                             report_too_many_unpacked_tuples();
                             element_types = element_types.concat_variadic_typevar(db, env, typevar);
-                        } else if matches!(element_ty, Type::TypeOperator(_)) {
+                        } else if self.is_unpackable_type_operator(element_ty) {
                             unpacks_type_operator = true;
                         } else if element_ty.is_unknown() && is_unpacked_comprehension(element) {
                             unpacks_failed_comprehension = true;
+                        } else if matches!(element_ty, Type::Dynamic(DynamicType::RaisedError(_))) {
+                            raised_error.get_or_insert(element_ty);
                         }
                     } else if self
                         .type_expression_flags(element)
@@ -1626,6 +1667,12 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 if unpacks_failed_comprehension {
                     self.store_expression_type(&tuple.slice, Type::unknown());
                     return Err(Type::unknown());
+                }
+
+                // Unpacking a sequence that raised a PEP 827 `RaiseError` raises it, too.
+                if let Some(raised_error) = raised_error {
+                    self.store_expression_type(&tuple.slice, raised_error);
+                    return Err(raised_error);
                 }
 
                 if unpacks_type_operator {
@@ -1684,7 +1731,14 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                                 == Type::SpecialForm(SpecialFormType::Unpack)
                     );
                 if single_element_is_unpack {
-                    if let Some(inner_tuple) =
+                    if is_unresolved_alias(db, env, single_element_ty) {
+                        return Err(self.evaluate_type_operator(
+                            TypeOperatorKind::TupleOf(Box::new([VariadicArg::Unpacked(
+                                single_element_ty,
+                            )])),
+                            tuple,
+                        ));
+                    } else if let Some(inner_tuple) =
                         single_element_ty.exact_tuple_instance_spec(self.db())
                     {
                         return Ok(TupleType::new(db, env, &inner_tuple));
@@ -1696,7 +1750,12 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                         && is_unpacked_comprehension(single_element)
                     {
                         return Err(Type::unknown());
-                    } else if matches!(single_element_ty, Type::TypeOperator(_)) {
+                    } else if matches!(
+                        single_element_ty,
+                        Type::Dynamic(DynamicType::RaisedError(_))
+                    ) {
+                        return Err(single_element_ty);
+                    } else if self.is_unpackable_type_operator(single_element_ty) {
                         return Err(self.evaluate_type_operator(
                             TypeOperatorKind::TupleOf(Box::new([VariadicArg::Unpacked(
                                 single_element_ty,
@@ -2604,7 +2663,13 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             | SpecialFormType::GetMemberType
             | SpecialFormType::FromUnion
             | SpecialFormType::NewProtocol
-            | SpecialFormType::NewTypedDict => {
+            | SpecialFormType::NewTypedDict
+            | SpecialFormType::GetArg
+            | SpecialFormType::GetArgs
+            | SpecialFormType::Length
+            | SpecialFormType::Slice
+            | SpecialFormType::GetSpecialAttr
+            | SpecialFormType::RaiseError => {
                 self.infer_type_operator_special_form_type_expression(subscript, special_form)
             }
             SpecialFormType::Not => {

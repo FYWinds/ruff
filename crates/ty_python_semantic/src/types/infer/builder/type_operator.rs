@@ -12,7 +12,8 @@ use crate::types::type_operator::{TypeOperatorKind, is_type_bool_operand};
 use crate::types::{SpecialFormType, Type, TypeContext, TypeOperatorType};
 
 /// Returns `true` if `expression` has the syntactic shape of a type boolean: a name, an
-/// attribute, a subscript, or `not`/`and`/`or` applied to such expressions.
+/// attribute, a subscript, a quantifier (`any(...)` / `all(...)` over a generator, see
+/// [`type_quantifier_generator`]), or `not`/`and`/`or` applied to such expressions.
 ///
 /// `if`/`and`/`or`/`not` expressions in a type expression are only interpreted as PEP 827 type
 /// operators if all of their condition operands have this shape; other shapes (such as
@@ -20,6 +21,7 @@ use crate::types::{SpecialFormType, Type, TypeContext, TypeOperatorType};
 pub(super) fn is_type_bool_operand_syntax(expression: &ast::Expr) -> bool {
     match expression {
         ast::Expr::Name(_) | ast::Expr::Attribute(_) | ast::Expr::Subscript(_) => true,
+        ast::Expr::Call(call) => type_quantifier_generator(call).is_some(),
         ast::Expr::UnaryOp(ast::ExprUnaryOp {
             op: ast::UnaryOp::Not,
             operand,
@@ -27,6 +29,26 @@ pub(super) fn is_type_bool_operand_syntax(expression: &ast::Expr) -> bool {
         }) => is_type_bool_operand_syntax(operand),
         ast::Expr::BoolOp(bool_op) => bool_op.values.iter().all(is_type_bool_operand_syntax),
         _ => false,
+    }
+}
+
+/// Returns the generator of a call with the syntactic shape of a PEP 827 quantifier: `any(...)`
+/// or `all(...)` with a single generator argument and no keyword arguments.
+///
+/// The semantic index uses the same purely syntactic test
+/// (`SemanticIndexBuilder::type_quantifier_generator` in `ty_python_core`) to decide that such a
+/// generator in a type expression gets no scope of its own; keep the two in sync. Whether the
+/// name actually refers to the builtin is checked during inference.
+pub(super) fn type_quantifier_generator(call: &ast::ExprCall) -> Option<&ast::ExprGenerator> {
+    let ast::Expr::Name(name) = &*call.func else {
+        return None;
+    };
+    if !matches!(name.id.as_str(), "any" | "all") || !call.arguments.keywords.is_empty() {
+        return None;
+    }
+    match &*call.arguments.args {
+        [ast::Expr::Generator(generator)] => Some(generator),
+        _ => None,
     }
 }
 
@@ -161,7 +183,13 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         let ty = if arguments.len() == usize::from(expected) {
             let operands: Vec<Type<'db>> = arguments
                 .iter()
-                .map(|argument| self.infer_type_expression(argument))
+                .map(|argument| {
+                    if special_form == SpecialFormType::Bool {
+                        self.infer_type_expression(argument)
+                    } else {
+                        self.infer_type_operator_class_argument(argument)
+                    }
+                })
                 .collect();
             let kind = match (special_form, operands.as_slice()) {
                 (SpecialFormType::IsAssignable, [source, target]) => {

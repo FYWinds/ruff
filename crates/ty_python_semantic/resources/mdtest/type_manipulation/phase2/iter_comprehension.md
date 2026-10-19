@@ -5,8 +5,8 @@
 is allowed.
 
 It iterates over the elements of the tuple type, keeps the elements for which every `if` condition
-is `Literal[True]`, and maps each of them to a type. In phase 2 there is exactly one `for` clause,
-and any number of `if` clauses.
+is `Literal[True]`, and maps each of them to a type. There can be any number of `if` clauses, and
+(since phase 3) several `for` clauses; see `phase3/multi_for.md`.
 
 Comprehensions can be spliced into `tuple[...]`, the now variadic `Union[...]`, `NewProtocol[...]`
 and `NewTypedDict[...]`.

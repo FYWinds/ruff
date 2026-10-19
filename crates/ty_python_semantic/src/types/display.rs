@@ -30,6 +30,7 @@ use crate::types::recursive::RecursiveType;
 use crate::types::signatures::{Parameter, Parameters, ParametersKind, Signature};
 use crate::types::tuple::{TupleSpec, VariableSegment};
 use crate::types::type_alias::QualifiedTypeAliasName;
+use crate::types::type_arguments::base_display_name;
 use crate::types::type_operator::{TypeOperatorKind, TypeOperatorType, VariadicArg};
 use crate::types::typevar::BoundTypeVarIdentity;
 use crate::types::visitor::TypeVisitor;
@@ -849,6 +850,16 @@ fn fmt_file_location<'db>(
     write!(f, " @ {path}:{line}:{column}")
 }
 
+/// How [`qualified_name_components_from_scope`] spells the path to an item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum QualifiedNameStyle {
+    /// For display: starts with the module name, and a function is spelled
+    /// `<locals of function 'f'>`.
+    Display,
+    /// Python's `__qualname__`: no module name, and a function is spelled `f.<locals>`.
+    Python,
+}
+
 /// Returns the qualified name components for a scope, excluding the item itself.
 ///
 /// This is the shared logic used by both [`QualifiedClassName`](super::class::QualifiedClassName)
@@ -862,6 +873,7 @@ pub(super) fn qualified_name_components_from_scope(
     file: ProgramFile<'_>,
     file_scope_id: FileScopeId,
     skip_count: usize,
+    style: QualifiedNameStyle,
 ) -> Vec<String> {
     let module_ast = parsed_module(db, file.python_file(db)).load(db);
     let index = semantic_index(db, file);
@@ -879,17 +891,26 @@ pub(super) fn qualified_name_components_from_scope(
             }
             ScopeKind::Function => {
                 if let Some(function_def) = node.as_function() {
-                    name_parts.push(format!(
-                        "<locals of function '{}'>",
-                        function_def.node(&module_ast).name.as_str()
-                    ));
+                    let name = function_def.node(&module_ast).name.as_str();
+                    match style {
+                        QualifiedNameStyle::Display => {
+                            name_parts.push(format!("<locals of function '{name}'>"));
+                        }
+                        QualifiedNameStyle::Python => {
+                            // The parts are reversed below.
+                            name_parts.push("<locals>".to_string());
+                            name_parts.push(name.to_string());
+                        }
+                    }
                 }
             }
             _ => {}
         }
     }
 
-    if let Some(module) = file_to_module(db, file.resolver_file(db)) {
+    if style == QualifiedNameStyle::Display
+        && let Some(module) = file_to_module(db, file.resolver_file(db))
+    {
         let module_name = module.name(db);
         name_parts.push(module_name.as_str().to_string());
     }
@@ -1163,7 +1184,14 @@ fn type_operator_precedence<'db>(db: &'db dyn Db, ty: Type<'db>) -> u8 {
             | TypeOperatorKind::TupleOf(_)
             | TypeOperatorKind::UnionOf(_)
             | TypeOperatorKind::NewProtocol(_)
-            | TypeOperatorKind::NewTypedDict(_) => 4,
+            | TypeOperatorKind::NewTypedDict(_)
+            | TypeOperatorKind::GetArg(..)
+            | TypeOperatorKind::GetArgs(..)
+            | TypeOperatorKind::Length(_)
+            | TypeOperatorKind::Slice(..)
+            | TypeOperatorKind::GetSpecialAttr(..)
+            | TypeOperatorKind::RaiseError { .. }
+            | TypeOperatorKind::Quantifier { .. } => 4,
         },
         _ => 4,
     }
@@ -1240,6 +1268,78 @@ fn fmt_type_operator<'db>(
         }
         f.write_char(']')
     };
+    // Writes `element for x in Iter[A] if c for y in Iter[B] ...` for an unpacked comprehension.
+    // A nested comprehension in the body stands for a further `for` clause.
+    let comprehension =
+        |f: &mut TypeWriter<'_, '_, 'db>, operator: TypeOperatorType<'db>| -> fmt::Result {
+            let mut clauses = Vec::new();
+            let mut current = operator;
+            let element = loop {
+                let TypeOperatorKind::UnpackMap {
+                    iterable,
+                    binder,
+                    body,
+                    conditions,
+                } = current.kind(db)
+                else {
+                    unreachable!("only called for unpacked comprehensions")
+                };
+                clauses.push((*binder, *iterable, conditions));
+                match body {
+                    VariadicArg::Unpacked(Type::TypeOperator(inner))
+                        if matches!(inner.kind(db), TypeOperatorKind::UnpackMap { .. }) =>
+                    {
+                        current = *inner;
+                    }
+                    _ => break *body,
+                }
+            };
+            match element {
+                VariadicArg::Single(ty) => operand(f, ty, 1)?,
+                VariadicArg::Unpacked(ty) => {
+                    f.write_str("Unpack[")?;
+                    operand(f, ty, 0)?;
+                    f.write_char(']')?;
+                }
+            }
+            for (binder, iterable, conditions) in clauses {
+                f.write_str(" for ")?;
+                f.write_str(binder.typevar(db).name(db))?;
+                f.write_str(" in ")?;
+                f.with_type(Type::SpecialForm(SpecialFormType::Iter))
+                    .write_str(SpecialFormType::Iter.name())?;
+                f.write_char('[')?;
+                operand(f, iterable, 0)?;
+                f.write_char(']')?;
+                for condition in conditions {
+                    f.write_str(" if ")?;
+                    operand(f, *condition, 1)?;
+                }
+            }
+            Ok(())
+        };
+    // Writes `GetArg[T, Base, Idx]`/`GetArgs[T, Base]`, with `Base` as a class name.
+    let with_base = |f: &mut TypeWriter<'_, '_, 'db>,
+                     form: SpecialFormType,
+                     ty: Type<'db>,
+                     base: Type<'db>,
+                     index: Option<Type<'db>>|
+     -> fmt::Result {
+        f.with_type(Type::SpecialForm(form))
+            .write_str(form.name())?;
+        f.write_char('[')?;
+        operand(f, ty, 0)?;
+        f.write_str(", ")?;
+        match base_display_name(db, base) {
+            Some(name) => f.with_type(base).write_str(name)?,
+            None => operand(f, base, 0)?,
+        }
+        if let Some(index) = index {
+            f.write_str(", ")?;
+            operand(f, index, 0)?;
+        }
+        f.write_char(']')
+    };
 
     match operator.kind(db) {
         TypeOperatorKind::IsAssignable(source, target) => {
@@ -1293,26 +1393,9 @@ fn fmt_type_operator<'db>(
             f.write_char('.')?;
             f.write_str(field.as_str())
         }
-        TypeOperatorKind::UnpackMap {
-            iterable,
-            binder,
-            body,
-            conditions,
-        } => {
+        TypeOperatorKind::UnpackMap { .. } => {
             f.write_str("*[")?;
-            operand(f, *body, 1)?;
-            f.write_str(" for ")?;
-            f.write_str(binder.typevar(db).name(db))?;
-            f.write_str(" in ")?;
-            f.with_type(Type::SpecialForm(SpecialFormType::Iter))
-                .write_str(SpecialFormType::Iter.name())?;
-            f.write_char('[')?;
-            operand(f, *iterable, 0)?;
-            f.write_char(']')?;
-            for condition in conditions {
-                f.write_str(" if ")?;
-                operand(f, *condition, 1)?;
-            }
+            comprehension(f, operator)?;
             f.write_char(']')
         }
         TypeOperatorKind::TupleOf(args) => variadic(f, "tuple", None, args),
@@ -1329,6 +1412,45 @@ fn fmt_type_operator<'db>(
             Some(SpecialFormType::NewTypedDict),
             args,
         ),
+        TypeOperatorKind::GetArg(ty, base, index) => {
+            with_base(f, SpecialFormType::GetArg, *ty, *base, Some(*index))
+        }
+        TypeOperatorKind::GetArgs(ty, base) => {
+            with_base(f, SpecialFormType::GetArgs, *ty, *base, None)
+        }
+        TypeOperatorKind::Length(ty) => special_form(f, SpecialFormType::Length, &[*ty]),
+        TypeOperatorKind::Slice(sequence, start, end) => {
+            special_form(f, SpecialFormType::Slice, &[*sequence, *start, *end])
+        }
+        TypeOperatorKind::GetSpecialAttr(ty, attribute) => {
+            special_form(f, SpecialFormType::GetSpecialAttr, &[*ty, *attribute])
+        }
+        TypeOperatorKind::RaiseError { message, args } => {
+            let args: Vec<_> = std::iter::once(VariadicArg::Single(*message))
+                .chain(args.iter().copied())
+                .collect();
+            variadic(
+                f,
+                SpecialFormType::RaiseError.name(),
+                Some(SpecialFormType::RaiseError),
+                &args,
+            )
+        }
+        TypeOperatorKind::Quantifier { all, elements } => {
+            f.write_str(if *all { "all(" } else { "any(" })?;
+            match elements {
+                Type::TypeOperator(inner)
+                    if matches!(inner.kind(db), TypeOperatorKind::UnpackMap { .. }) =>
+                {
+                    comprehension(f, *inner)?;
+                }
+                _ => {
+                    f.write_char('*')?;
+                    operand(f, *elements, 4)?;
+                }
+            }
+            f.write_char(')')
+        }
     }
 }
 

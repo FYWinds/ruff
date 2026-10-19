@@ -125,8 +125,9 @@ def _(
 
 ## What can be iterated
 
-`Iter` requires a tuple type with a fixed length, `Never` or `Any`. Iterating a union of tuples (for
-example the result of a lifted `Attrs[A | B]`) is an error.
+`Iter` requires a tuple type, `Never` or `Any`. Iterating something that is not a tuple, or a union
+of tuples (for example the result of a lifted `Attrs[A | B]`), is an error. (Tuples with an
+unbounded part can be iterated; see `phase3/unbounded_iteration.md`.)
 
 ```py
 from ty_extensions import Iter
@@ -140,36 +141,18 @@ def _(
     reveal_type(c)  # revealed: Unknown
 ```
 
-Iterating tuples of unbounded length is not supported yet.
-
-```py
-from ty_extensions import Iter
-
-def _(
-    a: tuple[*[list[t] for t in Iter[tuple[int, ...]]]],  # error: [invalid-type-form]
-    b: tuple[*[list[t] for t in Iter[tuple[int, *tuple[str, ...]]]]],  # error: [invalid-type-form]
-):
-    reveal_type(a)  # revealed: Unknown
-    reveal_type(b)  # revealed: Unknown
-
-def f[*Ts](*args: *Ts) -> tuple[*[list[t] for t in Iter[tuple[*Ts]]]]:  # error: [invalid-type-form]
-    raise NotImplementedError
-```
-
 ## Unsupported comprehension shapes
 
-Only a single `for` clause with a single name as its target is supported.
+Each `for` clause must bind a single name as its target. (Several `for` clauses are supported; see
+`phase3/multi_for.md`.)
 
 ```py
 from ty_extensions import Iter
 
 def _(
-    # error: [invalid-type-form]
-    a: tuple[*[dict[k, v] for k in Iter[tuple[int]] for v in Iter[tuple[str]]]],
     # error: [invalid-type-form]
     b: tuple[*[k for k, v in Iter[tuple[tuple[int, str]]]]],
 ):
-    reveal_type(a)  # revealed: Unknown
     reveal_type(b)  # revealed: Unknown
 ```
 

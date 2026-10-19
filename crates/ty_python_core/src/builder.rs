@@ -3468,10 +3468,15 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
     }
 
     /// Whether `expr` has the syntactic shape of a PEP 827 type-boolean operand: a name,
-    /// attribute, or subscript, or a `not`/`and`/`or` of such operands.
+    /// attribute, or subscript, a quantifier (`any(...)` / `all(...)`, see
+    /// [`Self::type_quantifier_generator`]), or a `not`/`and`/`or` of such operands.
+    ///
+    /// Must stay in sync with `is_type_bool_operand_syntax` in
+    /// `ty_python_semantic/src/types/infer/builder/type_operator.rs`.
     fn is_type_boolean_operand(expr: &ast::Expr) -> bool {
         match expr {
             ast::Expr::Name(_) | ast::Expr::Attribute(_) | ast::Expr::Subscript(_) => true,
+            ast::Expr::Call(call) => Self::type_quantifier_generator(call).is_some(),
             ast::Expr::UnaryOp(ast::ExprUnaryOp {
                 op: ast::UnaryOp::Not,
                 operand,
@@ -3480,6 +3485,50 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             ast::Expr::BoolOp(bool_op) => bool_op.values.iter().all(Self::is_type_boolean_operand),
             _ => false,
         }
+    }
+
+    /// If `call` has the syntactic shape of a PEP 827 quantifier — `any(<generator>)` or
+    /// `all(<generator>)` with exactly one positional generator argument and no keyword
+    /// arguments — returns the generator.
+    ///
+    /// Only the name is checked here; inference reports a shadowed `any` / `all`. Must stay in
+    /// sync with the quantifier-shape check in `ty_python_semantic`'s type-expression inference.
+    fn type_quantifier_generator(call: &ast::ExprCall) -> Option<&ast::ExprGenerator> {
+        let ast::Expr::Name(name) = call.func.as_ref() else {
+            return None;
+        };
+        if !matches!(name.id.as_str(), "any" | "all") || !call.arguments.keywords.is_empty() {
+            return None;
+        }
+        match &*call.arguments.args {
+            [ast::Expr::Generator(generator)] => Some(generator),
+            _ => None,
+        }
+    }
+
+    /// Walks a PEP 827 type-level comprehension (`*[elt for x in Iter[...]]`, or the generator
+    /// of a type-level `any(...)` / `all(...)`): it is evaluated entirely by type inference in
+    /// the enclosing scope. Don't create a comprehension scope and don't bind the targets; the
+    /// loop variables are resolved by inference before any place lookup, so their uses here only
+    /// leave used-but-unbound symbols in the current scope (which never count as members or
+    /// public symbols). The targets are still mapped to the current scope (without any binding)
+    /// so that expression-scope lookups on them succeed. Every `for` clause, its iterable and
+    /// filters, and the element are walked in the current scope.
+    fn visit_type_comprehension_parts(
+        &mut self,
+        elt: &'ast ast::Expr,
+        generators: &'ast [ast::Comprehension],
+    ) {
+        let scope = self.current_scope();
+        for generator in generators {
+            self.scopes_by_expression
+                .record_expression_tree(&generator.target, scope);
+            self.visit_expr(&generator.iter);
+            for if_expr in &generator.ifs {
+                self.visit_expr(if_expr);
+            }
+        }
+        self.visit_expr(elt);
     }
 
     /// Syntactic check for `Annotated` / `<module>.Annotated` as a subscript value.
@@ -3534,26 +3583,25 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                 ast::Expr::ListComp(ast::ExprListComp {
                     elt, generators, ..
                 }) => {
-                    // PEP 827 type-level comprehension (`*[T for x in Iter[...]]`): evaluated
-                    // entirely by type inference in the enclosing scope. Don't create a
-                    // comprehension scope and don't bind the targets; the loop variables are
-                    // resolved by inference before any place lookup, so their uses here only
-                    // leave used-but-unbound symbols in the current scope (which never count
-                    // as members or public symbols). The targets are still mapped to the current
-                    // scope (without any binding) so that expression-scope lookups on them
-                    // succeed. Later `for` clauses are rejected by inference but still walked so
-                    // that every sub-expression is indexed.
-                    let scope = self.current_scope();
-                    for generator in generators {
-                        self.scopes_by_expression
-                            .record_expression_tree(&generator.target, scope);
-                        self.visit_expr(&generator.iter);
-                        for if_expr in &generator.ifs {
-                            self.visit_expr(if_expr);
-                        }
-                    }
-                    self.visit_expr(elt);
+                    // PEP 827 type-level comprehension (`*[T for x in Iter[...]]`).
+                    self.visit_type_comprehension_parts(elt, generators);
                     return;
+                }
+                ast::Expr::Call(call) => {
+                    if let Some(generator) = Self::type_quantifier_generator(call) {
+                        // PEP 827 type-level `any(...)` / `all(...)`: the callee is visited
+                        // normally; the generator is walked like a type-level list
+                        // comprehension, without a generator scope.
+                        self.visit_expr(&call.func);
+                        let generator_expr = &call.arguments.args[0];
+                        self.with_semantic_checker(|semantic, builder| {
+                            semantic.visit_expr(generator_expr, builder);
+                        });
+                        self.scopes_by_expression
+                            .record_expression(generator_expr, self.current_scope());
+                        self.visit_type_comprehension_parts(&generator.elt, &generator.generators);
+                        return;
+                    }
                 }
                 ast::Expr::Subscript(ast::ExprSubscript { value, slice, .. })
                     if Self::is_annotated_special_form(value) =>

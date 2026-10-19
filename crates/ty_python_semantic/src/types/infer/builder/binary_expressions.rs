@@ -614,6 +614,11 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             (unknown @ Type::Dynamic(DynamicType::UnknownGeneric(_)), _, _)
             | (_, unknown @ Type::Dynamic(DynamicType::UnknownGeneric(_)), _) => Some(unknown),
 
+            // A PEP 827 `RaiseError` has already been reported where the type was used; it
+            // behaves like `Unknown` in value expressions.
+            (Type::Dynamic(DynamicType::RaisedError(_)), _, _)
+            | (_, Type::Dynamic(DynamicType::RaisedError(_)), _) => Some(Type::unknown()),
+
             (
                 placeholder @ Type::Dynamic(
                     DynamicType::UnspecializedTypeVar | DynamicType::UnknownLambdaParameter,

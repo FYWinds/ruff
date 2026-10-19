@@ -2212,6 +2212,10 @@ pub enum KnownFunction {
     Len,
     /// `builtins.repr`
     Repr,
+    /// `builtins.any`
+    Any,
+    /// `builtins.all`
+    All,
     /// `builtins.__import__`, which returns the top-level module.
     #[strum(serialize = "__import__")]
     DunderImport,
@@ -2355,6 +2359,8 @@ impl KnownFunction {
             | Self::HasAttr
             | Self::Len
             | Self::Repr
+            | Self::Any
+            | Self::All
             | Self::DunderImport => module.is_builtins(),
             Self::AssertType
             | Self::AssertNever
@@ -2458,6 +2464,8 @@ pub(crate) mod tests {
             let module = match function {
                 KnownFunction::Len
                 | KnownFunction::Repr
+                | KnownFunction::Any
+                | KnownFunction::All
                 | KnownFunction::IsInstance
                 | KnownFunction::HasAttr
                 | KnownFunction::IsSubclass

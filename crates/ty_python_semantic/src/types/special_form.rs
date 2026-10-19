@@ -112,6 +112,18 @@ pub enum SpecialFormType {
     NewTypedDict,
     /// The symbol `ty_extensions.FromUnion` (PEP 827 union decomposition)
     FromUnion,
+    /// The symbol `ty_extensions.GetArg` (PEP 827 basic operator)
+    GetArg,
+    /// The symbol `ty_extensions.GetArgs` (PEP 827 basic operator)
+    GetArgs,
+    /// The symbol `ty_extensions.Length` (PEP 827 basic operator)
+    Length,
+    /// The symbol `ty_extensions.Slice` (PEP 827 basic operator)
+    Slice,
+    /// The symbol `ty_extensions.GetSpecialAttr` (PEP 827 basic operator)
+    GetSpecialAttr,
+    /// The symbol `ty_extensions.RaiseError` (PEP 827 type-level error)
+    RaiseError,
     /// The symbol `ty_extensions._internal.TypeOf`
     TypeOf,
     /// The symbol `ty_extensions._internal.CallableTypeOf`
@@ -195,6 +207,12 @@ impl SpecialFormType {
             | Self::NewProtocol
             | Self::NewTypedDict
             | Self::FromUnion
+            | Self::GetArg
+            | Self::GetArgs
+            | Self::Length
+            | Self::Slice
+            | Self::GetSpecialAttr
+            | Self::RaiseError
             | Self::CallableTypeOf
             | Self::RegularCallableTypeOf
             | Self::Unknown
@@ -359,6 +377,12 @@ impl SpecialFormType {
             NewProtocol,
             NewTypedDict,
             FromUnion,
+            GetArg,
+            GetArgs,
+            Length,
+            Slice,
+            GetSpecialAttr,
+            RaiseError,
             TypeOf,
             CallableTypeOf,
             RegularCallableTypeOf,
@@ -418,6 +442,12 @@ impl SpecialFormType {
                     SpecialFormType::NewProtocol => Self::NewProtocol,
                     SpecialFormType::NewTypedDict => Self::NewTypedDict,
                     SpecialFormType::FromUnion => Self::FromUnion,
+                    SpecialFormType::GetArg => Self::GetArg,
+                    SpecialFormType::GetArgs => Self::GetArgs,
+                    SpecialFormType::Length => Self::Length,
+                    SpecialFormType::Slice => Self::Slice,
+                    SpecialFormType::GetSpecialAttr => Self::GetSpecialAttr,
+                    SpecialFormType::RaiseError => Self::RaiseError,
                     SpecialFormType::Literal => Self::Literal,
                     SpecialFormType::LiteralString => Self::LiteralString,
                     SpecialFormType::Never => Self::Never,
@@ -490,6 +520,12 @@ impl SpecialFormType {
                     SpecialFormTypeBuilder::NewProtocol => &[Self::NewProtocol],
                     SpecialFormTypeBuilder::NewTypedDict => &[Self::NewTypedDict],
                     SpecialFormTypeBuilder::FromUnion => &[Self::FromUnion],
+                    SpecialFormTypeBuilder::GetArg => &[Self::GetArg],
+                    SpecialFormTypeBuilder::GetArgs => &[Self::GetArgs],
+                    SpecialFormTypeBuilder::Length => &[Self::Length],
+                    SpecialFormTypeBuilder::Slice => &[Self::Slice],
+                    SpecialFormTypeBuilder::GetSpecialAttr => &[Self::GetSpecialAttr],
+                    SpecialFormTypeBuilder::RaiseError => &[Self::RaiseError],
                     SpecialFormTypeBuilder::Literal => &[Self::Literal],
                     SpecialFormTypeBuilder::LiteralString => &[Self::LiteralString],
                     SpecialFormTypeBuilder::Never => &[Self::Never],
@@ -617,7 +653,13 @@ impl SpecialFormType {
             | Self::GetMemberType
             | Self::NewProtocol
             | Self::NewTypedDict
-            | Self::FromUnion => module.is_ty_extensions(),
+            | Self::FromUnion
+            | Self::GetArg
+            | Self::GetArgs
+            | Self::Length
+            | Self::Slice
+            | Self::GetSpecialAttr
+            | Self::RaiseError => module.is_ty_extensions(),
 
             Self::Unknown
             | Self::Divergent
@@ -704,6 +746,12 @@ impl SpecialFormType {
             | Self::NewProtocol
             | Self::NewTypedDict
             | Self::FromUnion
+            | Self::GetArg
+            | Self::GetArgs
+            | Self::Length
+            | Self::Slice
+            | Self::GetSpecialAttr
+            | Self::RaiseError
             | Self::TypeOf
             | Self::CallableTypeOf
             | Self::RegularCallableTypeOf
@@ -754,6 +802,12 @@ impl SpecialFormType {
             | Self::NewProtocol
             | Self::NewTypedDict
             | Self::FromUnion
+            | Self::GetArg
+            | Self::GetArgs
+            | Self::Length
+            | Self::Slice
+            | Self::GetSpecialAttr
+            | Self::RaiseError
             | Self::Literal
             | Self::LiteralString
             | Self::Never
@@ -830,6 +884,12 @@ impl SpecialFormType {
             SpecialFormType::NewProtocol => "NewProtocol",
             SpecialFormType::NewTypedDict => "NewTypedDict",
             SpecialFormType::FromUnion => "FromUnion",
+            SpecialFormType::GetArg => "GetArg",
+            SpecialFormType::GetArgs => "GetArgs",
+            SpecialFormType::Length => "Length",
+            SpecialFormType::Slice => "Slice",
+            SpecialFormType::GetSpecialAttr => "GetSpecialAttr",
+            SpecialFormType::RaiseError => "RaiseError",
             SpecialFormType::TypeOf => "TypeOf",
             SpecialFormType::CallableTypeOf => "CallableTypeOf",
             SpecialFormType::RegularCallableTypeOf => "RegularCallableTypeOf",
@@ -893,6 +953,12 @@ impl SpecialFormType {
             | SpecialFormType::NewProtocol
             | SpecialFormType::NewTypedDict
             | SpecialFormType::FromUnion
+            | SpecialFormType::GetArg
+            | SpecialFormType::GetArgs
+            | SpecialFormType::Length
+            | SpecialFormType::Slice
+            | SpecialFormType::GetSpecialAttr
+            | SpecialFormType::RaiseError
             | SpecialFormType::Top
             | SpecialFormType::Bottom => &[KnownModule::TyExtensions],
 
@@ -1037,7 +1103,8 @@ impl SpecialFormType {
             | Self::Union
             | Self::Intersection
             | Self::NewProtocol
-            | Self::NewTypedDict => Err(InvalidTypeExpression::RequiresArguments(self)),
+            | Self::NewTypedDict
+            | Self::RaiseError => Err(InvalidTypeExpression::RequiresArguments(self)),
 
             Self::Protocol => Err(InvalidTypeExpression::Protocol),
             Self::Generic => Err(InvalidTypeExpression::Generic),
@@ -1054,7 +1121,11 @@ impl SpecialFormType {
             | Self::IsAssignable
             | Self::IsEquivalent
             | Self::GetMember
-            | Self::GetMemberType => Err(InvalidTypeExpression::RequiresTwoArguments(self)),
+            | Self::GetMemberType
+            | Self::GetArg
+            | Self::GetArgs
+            | Self::Slice
+            | Self::GetSpecialAttr => Err(InvalidTypeExpression::RequiresTwoArguments(self)),
 
             Self::Optional
             | Self::Not
@@ -1063,6 +1134,7 @@ impl SpecialFormType {
             | Self::Attrs
             | Self::Members
             | Self::FromUnion
+            | Self::Length
             | Self::Top
             | Self::Bottom
             | Self::TypeOf

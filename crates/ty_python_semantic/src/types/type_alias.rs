@@ -1,16 +1,18 @@
 use crate::ProgramEnvironment;
+use std::cell::Cell;
 use std::fmt::Write;
 
 use crate::{
     Db, FxOrderSet,
     types::{
         ApplyTypeMappingVisitor, BindingContext, BoundTypeVarIdentity, BoundTypeVarInstance,
-        DivergentFlags, GenericContext, KnownClass, KnownInstanceType, MaterializationKind, Type,
-        TypeContext, TypeMapping, TypeRecursionContext, TypingModule, UnionType, VarianceTerm,
+        DivergentFlags, DynamicType, GenericContext, KnownClass, KnownInstanceType,
+        MaterializationKind, Type, TypeContext, TypeMapping, TypeRecursionContext, TypingModule,
+        UnionType, VarianceTerm,
         cyclic::CycleDetector,
         definition_expression_type,
-        display::qualified_name_components_from_scope,
-        generics::{ApplySpecialization, Specialization, bind_typevar},
+        display::{QualifiedNameStyle, qualified_name_components_from_scope},
+        generics::{ApplySpecialization, Specialization, bind_typevar, walk_specialization_types},
         variance::{VarianceInferable, VarianceOrigin},
         visitor,
     },
@@ -205,6 +207,26 @@ impl<'db> PEP695TypeAliasType<'db> {
 
     /// The RHS type of a PEP-695 style type alias with specialization applied.
     fn value_type(self, db: &'db dyn Db) -> Type<'db> {
+        let alias = TypeAliasType::PEP695(self);
+        // The values of specialized aliases with type operators are cached: recursive aliases
+        // such as PEP 827's `Zip` resolve the same nested specializations many times.
+        if self.specialization(db).is_some() && alias_has_type_operator(db, alias) {
+            self.operator_alias_value_type(db)
+        } else {
+            alias.specialized_value_type(db, None)
+        }
+    }
+
+    #[salsa::tracked(
+        returns(copy),
+        cycle_initial=|_, id, _| Type::divergent_alias(id),
+        cycle_fn=|db: &'db dyn Db, cycle, previous: &Type<'db>, value: Type<'db>, alias: PEP695TypeAliasType<'db>| {
+            let env = ProgramEnvironment::from_scope(alias.rhs_scope(db));
+            value.cycle_normalized(db, &env, *previous, cycle)
+        },
+        heap_size=ruff_memory_usage::heap_size
+    )]
+    fn operator_alias_value_type(self, db: &'db dyn Db) -> Type<'db> {
         TypeAliasType::PEP695(self).specialized_value_type(db, None)
     }
 
@@ -535,6 +557,18 @@ impl<'db> TypeAliasType<'db> {
             }
             .recover(db, Type::TypeAlias(self))
             .unwrap_or(cycle);
+        }
+        // A recursive alias with type operators whose arguments keep growing never reaches a
+        // base case: cut it off silently (PEP 827 phase 3, P24).
+        if let Some(specialization) = self.specialization(db)
+            && specialization_exceeds_operator_alias_depth(
+                db,
+                &ProgramEnvironment::from_definition(self.definition(db)),
+                specialization,
+            )
+            && alias_has_type_operator(db, self)
+        {
+            return Type::unknown();
         }
         apply_type_alias_specialization(
             db,
@@ -908,7 +942,13 @@ impl<'db> QualifiedTypeAliasName<'db> {
 
         // Type aliases are defined directly in their enclosing scope (no body scope like classes),
         // so we don't skip any ancestor scopes.
-        qualified_name_components_from_scope(self.db, file, file_scope_id, 0)
+        qualified_name_components_from_scope(
+            self.db,
+            file,
+            file_scope_id,
+            0,
+            QualifiedNameStyle::Display,
+        )
     }
 }
 
@@ -920,4 +960,90 @@ impl std::fmt::Display for QualifiedTypeAliasName<'_> {
         }
         f.write_str(self.name)
     }
+}
+
+/// The maximum nesting depth of the specialization arguments of a type alias that contains type
+/// operators, before its value is cut off to `Unknown` (PEP 827 phase 3, P24).
+const MAX_OPERATOR_ALIAS_DEPTH: usize = 64;
+
+/// Returns `true` if the (unspecialized) value of `alias` contains a PEP 827 type operator or a
+/// raised error marker. Only such aliases are subject to the depth limit of recursive aliases,
+/// and only their values are searched for raised errors.
+pub(crate) fn alias_has_type_operator<'db>(db: &'db dyn Db, alias: TypeAliasType<'db>) -> bool {
+    #[salsa::tracked(
+        returns(copy),
+        cycle_initial=|_, _, _, ()| true,
+        heap_size=ruff_memory_usage::heap_size
+    )]
+    fn alias_has_type_operator_inner<'db>(
+        db: &'db dyn Db,
+        alias: TypeAliasType<'db>,
+        (): (),
+    ) -> bool {
+        let env = ProgramEnvironment::from_definition(alias.definition(db));
+        visitor::any_over_type(db, &env, alias.raw_value_type(db), false, |ty| {
+            matches!(
+                ty,
+                Type::TypeOperator(_) | Type::Dynamic(DynamicType::RaisedError(_))
+            )
+        })
+    }
+
+    alias_has_type_operator_inner(db, alias.unspecialized(db), ())
+}
+
+/// Returns `true` if the type tree of the arguments of `specialization` is nested deeper than
+/// [`MAX_OPERATOR_ALIAS_DEPTH`]. Every alias specialization, union and generic type counts as one
+/// level; the values of aliases are not evaluated.
+fn specialization_exceeds_operator_alias_depth<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    specialization: Specialization<'db>,
+) -> bool {
+    struct DepthVisitor<'db, 'a> {
+        env: &'a ProgramEnvironment<'db>,
+        depth: Cell<usize>,
+        exceeded: Cell<bool>,
+        recursion_guard: visitor::TypeCollector<'db>,
+    }
+
+    impl<'db> visitor::TypeVisitor<'db> for DepthVisitor<'db, '_> {
+        fn program_environment(&self) -> &ProgramEnvironment<'db> {
+            self.env
+        }
+
+        fn should_visit_lazy_type_attributes(&self) -> bool {
+            false
+        }
+
+        fn visit_type(&self, db: &'db dyn Db, ty: Type<'db>) {
+            if self.exceeded.get() {
+                return;
+            }
+            let depth = self.depth.get() + 1;
+            if depth > MAX_OPERATOR_ALIAS_DEPTH {
+                self.exceeded.set(true);
+                return;
+            }
+            self.depth.set(depth);
+            match ty {
+                Type::TypeAlias(alias) => {
+                    if let Some(specialization) = alias.specialization(db) {
+                        walk_specialization_types(db, specialization, self);
+                    }
+                }
+                _ => visitor::walk_type_with_recursion_guard(db, ty, self, &self.recursion_guard),
+            }
+            self.depth.set(depth - 1);
+        }
+    }
+
+    let visitor = DepthVisitor {
+        env,
+        depth: Cell::new(0),
+        exceeded: Cell::new(false),
+        recursion_guard: visitor::TypeCollector::default(),
+    };
+    walk_specialization_types(db, specialization, &visitor);
+    visitor.exceeded.get()
 }

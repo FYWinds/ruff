@@ -67,7 +67,7 @@ use ruff_text_size::{Ranged, TextRange};
 use rustc_hash::FxHashSet;
 use ty_python_core::ProgramFile;
 use ty_python_core::definition::Definition;
-use ty_python_core::scope::ScopeId;
+use ty_python_core::scope::{FileScopeId, ScopeId};
 use ty_python_core::{place_table, use_def_map};
 
 mod dynamic_literal;
@@ -1408,6 +1408,18 @@ impl<'db> ClassType<'db> {
                 Some(generic.specialization(db)),
             ),
         }
+    }
+
+    /// Returns the (specialized) class in the MRO of this class whose class literal is `origin`,
+    /// e.g. `Iterable[int]` for `list[int]` and the origin `Iterable`.
+    pub(super) fn find_base_specialization(
+        self,
+        db: &'db dyn Db,
+        origin: ClassLiteral<'db>,
+    ) -> Option<ClassType<'db>> {
+        self.iter_mro(db)
+            .filter_map(ClassBase::into_class)
+            .find(|base| base.class_literal(db) == origin)
     }
 
     /// Iterate over the method resolution order ("MRO") of the class, optionally applying an
@@ -3394,7 +3406,35 @@ impl<'db> QualifiedClassName<'db> {
     /// `m` inside the namespace of a class `C` in the module `a.b` would return
     /// `["a", "b", "C", "<locals of function 'm'>"]`.
     pub(super) fn components_excluding_self(&self) -> Vec<String> {
-        let (file, file_scope_id, skip_count) = match self.class {
+        let (file, file_scope_id, skip_count) = self.enclosing_scope();
+        display::qualified_name_components_from_scope(
+            self.db,
+            file,
+            file_scope_id,
+            skip_count,
+            display::QualifiedNameStyle::Display,
+        )
+    }
+
+    /// Returns the value of the class's `__qualname__` attribute as Python computes it, e.g.
+    /// `Outer.Inner` or `f.<locals>.C`.
+    pub(super) fn python_qualname(&self) -> String {
+        let (file, file_scope_id, skip_count) = self.enclosing_scope();
+        let mut components = display::qualified_name_components_from_scope(
+            self.db,
+            file,
+            file_scope_id,
+            skip_count,
+            display::QualifiedNameStyle::Python,
+        );
+        components.push(self.class.name(self.db).to_string());
+        components.join(".")
+    }
+
+    /// Returns the scope in which the qualified name of this class starts, and how many
+    /// ancestor scopes to skip.
+    fn enclosing_scope(&self) -> (ProgramFile<'db>, FileScopeId, usize) {
+        match self.class {
             ClassLiteral::Static(class) => {
                 let body_scope = class.body_scope(self.db);
                 // Skip the class body scope itself.
@@ -3422,9 +3462,7 @@ impl<'db> QualifiedClassName<'db> {
                 let scope = enum_lit.scope(self.db);
                 (scope.program_file(self.db), scope.file_scope_id(self.db), 0)
             }
-        };
-
-        display::qualified_name_components_from_scope(self.db, file, file_scope_id, skip_count)
+        }
     }
 }
 

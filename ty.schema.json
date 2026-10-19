@@ -1420,6 +1420,16 @@
             }
           ]
         },
+        "raised-type-error": {
+          "title": "detects type-level errors raised with `RaiseError`",
+          "description": "## What it does\n\nReports type-level errors raised with the experimental [PEP 827] `RaiseError[S, *Ts]` operator.\n\n## Why is this bad?\n\n`RaiseError` represents an explicit request from the author of a type to report an error when the\ntype is evaluated with arguments it does not support. The error is reported where the type is\nused: in an annotation or another type expression, or at a call whose specialized return type\nraises the error. A `RaiseError` in a branch of a conditional type that is not taken, or in the\ndefinition of a generic type alias, is not reported.\n\nThe type that raised the error evaluates to `Any`.\n\n## Examples\n\n```toml\n[environment]\npython-version = \"3.12\"\n```\n\n```python\nfrom typing import Literal\nfrom ty_extensions import IsAssignable, RaiseError\n\ntype OnlyInts[T] = T if IsAssignable[T, int] else RaiseError[Literal[\"expected an int\"], T]\n\ndef f(x: OnlyInts[str]): ...  # error: \"expected an int: str\"\n```\n\n[PEP 827]: https://peps.python.org/pep-0827/",
+          "default": "error",
+          "oneOf": [
+            {
+              "$ref": "#/definitions/Level"
+            }
+          ]
+        },
         "raw-string-type-annotation": {
           "title": "detects raw strings in type annotation positions",
           "description": "## What it does\n\nChecks for raw-strings in type annotation positions.\n\n## Why is this bad?\n\nStatic analysis tools like ty can't analyze type annotations that use raw-string notation.\n\n## Examples\n\n```python\ndef test() -> r\"int\":  # error\n    return 1\n```\n\nUse instead:\n\n```python\ndef test() -> \"int\":\n    return 1\n```",

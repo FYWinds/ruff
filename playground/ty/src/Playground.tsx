@@ -310,6 +310,7 @@ export default function Playground() {
       <Header
         theme={theme}
         tool="ty"
+        repository="https://github.com/FYWinds/ty"
         version={version}
         onChangeTheme={setTheme}
         edit={files.revision}
@@ -390,6 +391,7 @@ function setExampleUrl(slug: string | null) {
     url.searchParams.delete("example");
   } else {
     url.pathname = "/";
+    url.hash = "";
     url.searchParams.set("example", slug);
   }
   window.history.replaceState(null, "", url);
@@ -676,7 +678,7 @@ async function startPlayground(): Promise<InitializedPlayground> {
   const monaco = await loader.init();
 
   setupMonaco(monaco, {
-    uri: "https://raw.githubusercontent.com/astral-sh/ruff/main/ty.schema.json",
+    uri: "https://raw.githubusercontent.com/FYWinds/ruff/pep827-type-manipulation/ty.schema.json",
     fileMatch: ["ty.json"],
     schema: tySchema,
   });

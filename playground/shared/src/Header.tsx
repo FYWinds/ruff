@@ -19,6 +19,7 @@ export default function Header({
   onCopyMarkdown,
   onDownload,
   examples,
+  repository,
 }: {
   theme: Theme;
   tool: "ruff" | "ty";
@@ -32,6 +33,8 @@ export default function Header({
   onDownload(): void;
   /** Optional examples picker, rendered before the Reset button. */
   examples?: ReactNode;
+  /** Repository linked from the header; defaults to the upstream tool repository. */
+  repository?: string;
 }) {
   return (
     <div
@@ -57,7 +60,9 @@ export default function Header({
           </div>
         ) : null}
         <Divider />
-        <RepoButton href={`https://github.com/astral-sh/${tool}`} />
+        <RepoButton
+          href={repository ?? `https://github.com/astral-sh/${tool}`}
+        />
         <Divider />
         {examples != null ? (
           <div className="max-sm:hidden flex">{examples}</div>

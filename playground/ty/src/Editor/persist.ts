@@ -1,5 +1,5 @@
 import { type Example, findExample } from "../examples";
-import { fetchPlayground, savePlayground } from "./api";
+import { decodePlayground, encodePlayground } from "./share";
 import {
   generatePlaygroundMarkdown,
   generatePlaygroundMarkdownLink,
@@ -20,11 +20,11 @@ export interface RestoredWorkspace {
 }
 
 /**
- * Persist the workspace and generate a shareable URL.
+ * Generate a self-contained shareable URL for the workspace.
  */
 async function shareUrl(workspace: Workspace): Promise<string> {
-  const id = await savePlayground(workspace);
-  return `${window.location.origin}/${encodeURIComponent(id)}`;
+  const fragment = await encodePlayground(workspace);
+  return `${window.location.origin}/#${fragment}`;
 }
 
 /**
@@ -56,23 +56,24 @@ export async function copyAsMarkdown(workspace: Workspace): Promise<void> {
 /**
  * Restore the workspace, in order of precedence, from:
  *
- * 1. the share ID in the URL path,
+ * 1. the share link in the URL fragment,
  * 2. the `?example=<slug>` query parameter,
  * 3. local storage.
  *
  * Returns `null` if there is nothing to restore.
  */
 export async function restore(): Promise<RestoredWorkspace | null> {
-  // URLs stored in the database, like:
-  //     https://play.ruff.rs/1b9d6bcd-bbfd-4b2d-9b5d-ab8dfbbd4bed
-  const id = window.location.pathname.slice(1);
-  if (id !== "") {
-    const playground = await fetchPlayground(id);
-    if (playground == null) {
-      return null;
+  const fragment = window.location.hash.slice(1);
+  if (fragment !== "") {
+    try {
+      const playground = await decodePlayground(fragment);
+      if (playground != null) {
+        return { workspace: playground, example: null };
+      }
+    } catch (error) {
+      // oxlint-disable-next-line no-console
+      console.warn("Failed to restore the shared workspace:", error);
     }
-
-    return { workspace: playground, example: null };
   }
 
   const slug = new URLSearchParams(window.location.search).get("example");

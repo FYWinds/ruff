@@ -1,7 +1,7 @@
 import MonacoEditor from "@monaco-editor/react";
 import { AstralButton, Theme } from "shared";
 import { ReadonlyFiles } from "../Playground";
-import type { Example } from "../examples";
+import { type Example, phaseDescription } from "../examples";
 import { Suspense, use, useState } from "react";
 import classNames from "classnames";
 
@@ -73,7 +73,7 @@ function About({
     sections.push(`TypeScript equivalent: \`${example.ts}\``);
   }
   sections.push(
-    `Deep link: \`?example=${example.slug}\` · ${example.phase === 0 ? "existing ty feature" : `PEP 827 phase ${example.phase}`}`,
+    `Deep link: \`?example=${example.slug}\` · ${phaseDescription(example.phase)}`,
   );
 
   return (

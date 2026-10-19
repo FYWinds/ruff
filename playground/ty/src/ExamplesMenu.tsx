@@ -10,7 +10,7 @@ import {
   Text,
 } from "react-aria-components";
 import { AstralButton } from "shared";
-import type { Example } from "./examples";
+import { type Example, phaseGroupLabel } from "./examples";
 
 export interface ExamplesMenuProps {
   examples: readonly Example[];
@@ -52,9 +52,7 @@ export default function ExamplesMenu({
           {phases.map(([phase, phaseExamples]) => (
             <MenuSection key={phase} id={`phase-${phase}`}>
               <Header className="px-3 pt-2 pb-1 text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">
-                {phase === 0
-                  ? "Existing ty features"
-                  : `PEP 827 · phase ${phase}`}
+                {phaseGroupLabel(phase)}
               </Header>
               {phaseExamples.map((example) => (
                 <MenuItem

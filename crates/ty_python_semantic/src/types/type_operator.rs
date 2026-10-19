@@ -8,6 +8,9 @@
 //! splicing into `tuple[...]`/`Union[...]`, and structural synthesis (`NewProtocol`,
 //! `NewTypedDict`).
 //!
+//! Phase 4: string operators (`Uppercase`, `Lowercase`, `Capitalize`, `Uncapitalize`, `Concat`,
+//! and `Slice` over strings); see [`super::string_ops`].
+//!
 //! Operators are evaluated eagerly whenever their operands are fully known. Only operators whose
 //! operands still contain unsolved type variables (or other unresolved operators) are stored as
 //! [`Type::TypeOperator`]; they are re-evaluated whenever a type mapping (e.g. a specialization)
@@ -23,10 +26,13 @@ use super::callable::walk_callable_type;
 use super::function::{FunctionType, walk_function_type};
 use super::generics::walk_specialization_types;
 
+use super::literal::MAX_STRING_LITERAL_SIZE;
+use super::member_introspection::string_literal_type;
 use super::member_introspection::{
     all_qualifiers_type, find_member, member_args, member_instance, members_of, parse_qualifiers,
 };
 use super::signatures::CallableSignature;
+use super::string_ops::{StringCaseOp, StringOperand};
 use super::tuple::{Tuple, TupleSpec, TupleSpecBuilder, TupleType, VariableSegment};
 use super::type_alias::alias_has_type_operator;
 use super::type_arguments;
@@ -186,6 +192,10 @@ pub enum TypeOperatorKind<'db> {
     Length(Type<'db>),
     /// `Slice[S, Start, End]`
     Slice(Type<'db>, Type<'db>, Type<'db>),
+    /// `Uppercase[S]`, `Lowercase[S]`, `Capitalize[S]` or `Uncapitalize[S]`
+    StringCase(StringCaseOp, Type<'db>),
+    /// `Concat[S1, S2]`
+    Concat(Type<'db>, Type<'db>),
     /// `GetSpecialAttr[T, Attr]`
     GetSpecialAttr(Type<'db>, Type<'db>),
     /// `RaiseError[S, *Ts]`. Only exists in this form while its operands contain unsolved type
@@ -249,6 +259,11 @@ impl<'db> TypeOperatorKind<'db> {
                 f(*sequence, OperandRole::CovariantInput);
                 f(*start, Input);
                 f(*end, Input);
+            }
+            Self::StringCase(_, a) => f(*a, OperandRole::CovariantInput),
+            Self::Concat(a, b) => {
+                f(*a, OperandRole::CovariantInput);
+                f(*b, OperandRole::CovariantInput);
             }
             Self::RaiseError { message, args } => {
                 f(*message, Input);
@@ -366,6 +381,11 @@ impl<'db> TypeOperatorKind<'db> {
                 let sequence = f(*sequence, OperandRole::CovariantInput);
                 let [start, end] = [*start, *end].map(|ty| f(ty, Input));
                 Self::Slice(sequence?, start?, end?)
+            }
+            Self::StringCase(op, a) => Self::StringCase(*op, f(*a, OperandRole::CovariantInput)?),
+            Self::Concat(a, b) => {
+                let [a, b] = [*a, *b].map(|ty| f(ty, OperandRole::CovariantInput));
+                Self::Concat(a?, b?)
             }
             Self::GetSpecialAttr(a, b) => {
                 let [a, b] = [*a, *b].map(|ty| f(ty, Input));
@@ -1276,6 +1296,24 @@ impl<'db> TypeOperatorType<'db> {
                     type_arguments::slice(db, env, args[0], args[1], args[2])
                 })
             }
+            TypeOperatorKind::StringCase(op, operand) => {
+                Self::evaluate_string_operator(db, env, &kind, op.name(), &[*operand], |values| {
+                    op.apply(values[0])
+                })
+            }
+            TypeOperatorKind::Concat(left, right) => Self::evaluate_string_operator(
+                db,
+                env,
+                &kind,
+                "Concat",
+                &[*left, *right],
+                |values| {
+                    let mut result = String::with_capacity(values[0].len() + values[1].len());
+                    result.push_str(values[0]);
+                    result.push_str(values[1]);
+                    result
+                },
+            ),
             TypeOperatorKind::GetSpecialAttr(ty, attribute) => {
                 Self::evaluate_lifted(db, env, &kind, &[*ty, *attribute], |args| {
                     type_arguments::get_special_attr(db, env, args[0], args[1])
@@ -1336,6 +1374,65 @@ impl<'db> TypeOperatorType<'db> {
         })
     }
 
+    /// Evaluates a string operator (`Uppercase`, `Concat`, ...) lifted over unions. For every
+    /// combination, the arguments are classified by [`StringOperand::classify`]: an argument
+    /// that is not assignable to `str` is an error; otherwise a dynamic argument is the result,
+    /// then `str` and `LiteralString` arguments widen the result to that type, and only all
+    /// literal arguments are computed by `f`. A result longer than [`MAX_STRING_LITERAL_SIZE`]
+    /// is widened to `LiteralString`.
+    fn evaluate_string_operator(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        kind: &TypeOperatorKind<'db>,
+        operator_name: &str,
+        args: &[Type<'db>],
+        f: impl Fn(&[&str]) -> String,
+    ) -> OperatorResult<'db> {
+        if args.iter().any(Type::is_unknown) {
+            return Ok(Type::unknown());
+        }
+        if args.iter().any(|arg| needs_deferral(db, env, *arg)) {
+            return Ok(Type::TypeOperator(TypeOperatorType::new(db, kind.clone())));
+        }
+        lift_over_unions(db, env, args, |args| {
+            let operands: Vec<StringOperand> = args
+                .iter()
+                .map(|arg| StringOperand::classify(db, env, *arg))
+                .collect();
+            if let Some(index) = operands
+                .iter()
+                .position(|operand| matches!(operand, StringOperand::Invalid))
+            {
+                return Err(TypeOperatorError::new(format!(
+                    "`{operator_name}` requires a string type, but got `{}`",
+                    args[index].display(db, env)
+                )));
+            }
+            let mut values = Vec::with_capacity(operands.len());
+            let mut widened = None;
+            for operand in &operands {
+                match operand {
+                    StringOperand::Dynamic(dynamic) => return Ok(*dynamic),
+                    StringOperand::Str => widened = Some(KnownClass::Str.to_instance(db, env)),
+                    StringOperand::LiteralString => {
+                        widened.get_or_insert_with(Type::literal_string);
+                    }
+                    StringOperand::Literal(value) => values.push(*value),
+                    StringOperand::Invalid => unreachable!("checked above"),
+                }
+            }
+            if let Some(widened) = widened {
+                return Ok(widened);
+            }
+            let result = f(&values);
+            Ok(if result.len() <= MAX_STRING_LITERAL_SIZE {
+                string_literal_type(db, &result)
+            } else {
+                Type::literal_string()
+            })
+        })
+    }
+
     /// Evaluate `RaiseError[message, *args]` to a raised error marker.
     fn evaluate_raise_error(
         db: &'db dyn Db,
@@ -1366,7 +1463,7 @@ impl<'db> TypeOperatorType<'db> {
                 VariadicArg::Single(ty) => parts.push(display(ty)),
                 VariadicArg::Unpacked(ty) => match try_evaluate_sequence(db, env, ty) {
                     Ok(Sequence::Fixed(elements)) => {
-                        parts.extend(elements.into_iter().map(display))
+                        parts.extend(elements.into_iter().map(display));
                     }
                     Ok(Sequence::Deferred) => return defer(),
                     Ok(Sequence::Unbounded { .. } | Sequence::Dynamic(_) | Sequence::Error)
@@ -1679,11 +1776,18 @@ impl<'db> TypeOperatorType<'db> {
             | TypeOperatorKind::FromUnion(_)
             | TypeOperatorKind::UnpackMap { .. }
             | TypeOperatorKind::TupleOf(_)
-            | TypeOperatorKind::GetArgs(..)
-            | TypeOperatorKind::Slice(..) => Type::homogeneous_tuple(db, env, Type::any()),
+            | TypeOperatorKind::GetArgs(..) => Type::homogeneous_tuple(db, env, Type::any()),
+            TypeOperatorKind::Slice(..) => UnionType::from_two_elements(
+                db,
+                env,
+                Type::homogeneous_tuple(db, env, Type::any()),
+                KnownClass::Str.to_instance(db, env),
+            ),
             TypeOperatorKind::GetMember(..) => member_instance(db, env, [Type::any(); 5]),
             TypeOperatorKind::MemberAccess(_, MemberField::Name)
-            | TypeOperatorKind::GetSpecialAttr(..) => KnownClass::Str.to_instance(db, env),
+            | TypeOperatorKind::GetSpecialAttr(..)
+            | TypeOperatorKind::StringCase(..)
+            | TypeOperatorKind::Concat(..) => KnownClass::Str.to_instance(db, env),
             TypeOperatorKind::MemberAccess(_, MemberField::Quals) => all_qualifiers_type(db, env),
             TypeOperatorKind::Length(_) => UnionType::from_two_elements(
                 db,

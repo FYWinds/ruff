@@ -217,10 +217,75 @@ literal type, or `None` if `T` has an unbounded part. Unions are distributed ove
 Slice: _SpecialForm
 """
 `Slice[S, Start, End]` is an experimental [PEP 827] operator: the slice `S[Start:End]` of the tuple
-type `S`, where `Start` and `End` are `int` literal types or `None`. Unions are distributed over.
+or string type `S`, where `Start` and `End` are `int` literal types or `None`. Strings are sliced
+by code point, like Python's `str`. Unions are distributed over.
 
 ```python
 type DropLast[T] = Slice[T, Literal[0], Literal[-1]]
+```
+
+[PEP 827]: https://peps.python.org/pep-0827/
+"""
+
+Uppercase: _SpecialForm
+"""
+`Uppercase[S]` is an experimental [PEP 827] operator: the string literal type `S` converted to
+uppercase, like Python's `str.upper` (with full Unicode case mappings, e.g. `ß` becomes `SS`).
+Unions are distributed over; `str` and `LiteralString` arguments give `str` and `LiteralString`.
+
+String arguments must be written as `Literal["..."]`: a bare string is a forward reference.
+
+```python
+type Constant[S] = Uppercase[S]  # Constant[Literal["max_size"]] is Literal["MAX_SIZE"]
+```
+
+[PEP 827]: https://peps.python.org/pep-0827/
+"""
+
+Lowercase: _SpecialForm
+"""
+`Lowercase[S]` is an experimental [PEP 827] operator: the string literal type `S` converted to
+lowercase, like Python's `str.lower`. Unions are distributed over; `str` and `LiteralString`
+arguments give `str` and `LiteralString`.
+
+String arguments must be written as `Literal["..."]`: a bare string is a forward reference.
+
+[PEP 827]: https://peps.python.org/pep-0827/
+"""
+
+Capitalize: _SpecialForm
+"""
+`Capitalize[S]` is an experimental [PEP 827] operator: the string literal type `S` capitalized
+like Python's `str.capitalize`: the first character is converted to titlecase and **the rest is
+converted to lowercase** (`Capitalize[Literal["fooBar"]]` is `Literal["Foobar"]`, unlike
+TypeScript's `Capitalize`). Unions are distributed over.
+
+String arguments must be written as `Literal["..."]`: a bare string is a forward reference.
+
+[PEP 827]: https://peps.python.org/pep-0827/
+"""
+
+Uncapitalize: _SpecialForm
+"""
+`Uncapitalize[S]` is an experimental [PEP 827] operator: the string literal type `S` with only its
+first character converted to lowercase (`Uncapitalize[Literal["FOO"]]` is `Literal["fOO"]`).
+Unions are distributed over.
+
+String arguments must be written as `Literal["..."]`: a bare string is a forward reference.
+
+[PEP 827]: https://peps.python.org/pep-0827/
+"""
+
+Concat: _SpecialForm
+"""
+`Concat[S1, S2]` is an experimental [PEP 827] operator: the concatenation of the string literal
+types `S1` and `S2`. Unions are distributed over (every combination is concatenated); `str` and
+`LiteralString` arguments give `str` and `LiteralString`.
+
+String arguments must be written as `Literal["..."]`: a bare string is a forward reference.
+
+```python
+type Getter[K] = Concat[Literal["get_"], K]  # Getter[Literal["name"]] is Literal["get_name"]
 ```
 
 [PEP 827]: https://peps.python.org/pep-0827/

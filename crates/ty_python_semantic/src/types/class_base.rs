@@ -320,6 +320,11 @@ impl<'db> ClassBase<'db> {
                 | SpecialFormType::GetArgs
                 | SpecialFormType::Length
                 | SpecialFormType::Slice
+                | SpecialFormType::Uppercase
+                | SpecialFormType::Lowercase
+                | SpecialFormType::Capitalize
+                | SpecialFormType::Uncapitalize
+                | SpecialFormType::Concat
                 | SpecialFormType::GetSpecialAttr
                 | SpecialFormType::RaiseError
                 | SpecialFormType::TypeOf

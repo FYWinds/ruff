@@ -176,6 +176,7 @@ mod set_theoretic;
 mod signatures;
 mod special_form;
 mod string_annotation;
+mod string_ops;
 mod subclass_of;
 #[cfg(test)]
 pub(crate) mod tests;

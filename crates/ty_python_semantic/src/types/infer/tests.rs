@@ -1,11 +1,11 @@
 use std::assert_matches;
 use std::fmt::Write;
 
-use super::builder::TypeInferenceBuilder;
 use crate::db::tests::{TestDb, TestDbBuilder, setup_db};
 use crate::lint::{LintSource, RuleSelection};
 use crate::place::symbol;
 use crate::place::{ConsideredDefinitions, Place, PlaceAndQualifiers};
+use crate::types::literal::MAX_STRING_LITERAL_SIZE;
 use crate::types::{KnownClass, KnownInstanceType, check_types};
 use ruff_db::diagnostic::{Diagnostic, DiagnosticId, Severity};
 use ruff_db::files::{File, system_path_to_file};
@@ -289,7 +289,7 @@ fn not_literal_string() -> anyhow::Result<()> {
             assert_type(not 0*"{y}", Literal[True])
             assert_type(not (-100)*"{y}", Literal[True])
             "#,
-        y = "a".repeat(TypeInferenceBuilder::MAX_STRING_LITERAL_SIZE + 1),
+        y = "a".repeat(MAX_STRING_LITERAL_SIZE + 1),
     );
     db.write_dedented("src/a.py", &content)?;
 
@@ -319,9 +319,9 @@ fn multiplied_string() -> anyhow::Result<()> {
             assert_type(0 * "hello", Literal[""])
             assert_type(-3 * "hello", Literal[""])
             "#,
-        y = TypeInferenceBuilder::MAX_STRING_LITERAL_SIZE,
-        z = TypeInferenceBuilder::MAX_STRING_LITERAL_SIZE + 1,
-        a_repeated = "a".repeat(TypeInferenceBuilder::MAX_STRING_LITERAL_SIZE),
+        y = MAX_STRING_LITERAL_SIZE,
+        z = MAX_STRING_LITERAL_SIZE + 1,
+        a_repeated = "a".repeat(MAX_STRING_LITERAL_SIZE),
     );
     db.write_dedented("src/a.py", &content)?;
 
@@ -343,7 +343,7 @@ fn multiplied_literal_string() -> anyhow::Result<()> {
             assert_type(0*"{y}", Literal[""])
             assert_type((-100)*"{y}", Literal[""])
             "#,
-        y = "a".repeat(TypeInferenceBuilder::MAX_STRING_LITERAL_SIZE + 1),
+        y = "a".repeat(MAX_STRING_LITERAL_SIZE + 1),
     );
     db.write_dedented("src/a.py", &content)?;
 
@@ -362,8 +362,8 @@ fn truncated_string_literals_become_literal_string() -> anyhow::Result<()> {
             assert_type("{y}", LiteralString)
             assert_type("a" + "{z}", LiteralString)
             "#,
-        y = "a".repeat(TypeInferenceBuilder::MAX_STRING_LITERAL_SIZE + 1),
-        z = "a".repeat(TypeInferenceBuilder::MAX_STRING_LITERAL_SIZE),
+        y = "a".repeat(MAX_STRING_LITERAL_SIZE + 1),
+        z = "a".repeat(MAX_STRING_LITERAL_SIZE),
     );
     db.write_dedented("src/a.py", &content)?;
 
@@ -384,7 +384,7 @@ fn adding_string_literals_and_literal_string() -> anyhow::Result<()> {
             assert_type("a" + "{y}", LiteralString)
             assert_type("{y}" + "{y}", LiteralString)
             "#,
-        y = "a".repeat(TypeInferenceBuilder::MAX_STRING_LITERAL_SIZE + 1),
+        y = "a".repeat(MAX_STRING_LITERAL_SIZE + 1),
     );
     db.write_dedented("src/a.py", &content)?;
 

@@ -107,6 +107,7 @@ use crate::types::infer::{
     TypeAndRange, TypeExpressionFlags, infer_statement_types, nearest_enclosing_class,
     nearest_enclosing_function, original_class_type,
 };
+use crate::types::literal::MAX_STRING_LITERAL_SIZE;
 use crate::types::match_pattern::{ClassPatternPositionalResult, class_pattern_positional_result};
 use crate::types::member::inherited_class_body_declaration;
 use crate::types::narrow::NarrowingEvaluatorExtension;
@@ -494,12 +495,6 @@ fn transparent_callable_decorator_result<'db>(
 }
 
 impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
-    /// How big a string do we build before bailing?
-    ///
-    /// This is a fairly arbitrary number. It should be *far* more than enough
-    /// for most use cases, but we can reevaluate it later if useful.
-    pub(super) const MAX_STRING_LITERAL_SIZE: usize = 4096;
-
     /// Creates a new builder for inferring types in a region.
     pub(super) fn new(
         db: &'db dyn Db,
@@ -7216,7 +7211,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 aliased_type,
             )));
         }
-        if literal.value.len() <= Self::MAX_STRING_LITERAL_SIZE {
+        if literal.value.len() <= MAX_STRING_LITERAL_SIZE {
             Type::string_literal(self.db(), literal.value.to_str())
         } else {
             Type::literal_string()
@@ -13215,9 +13210,7 @@ impl StringPartsCollector {
 
     fn push_str(&mut self, literal: &str) {
         if let Some(mut concatenated) = self.concatenated.take() {
-            if concatenated.len().saturating_add(literal.len())
-                <= TypeInferenceBuilder::MAX_STRING_LITERAL_SIZE
-            {
+            if concatenated.len().saturating_add(literal.len()) <= MAX_STRING_LITERAL_SIZE {
                 concatenated.push_str(literal);
                 self.concatenated = Some(concatenated);
             } else {

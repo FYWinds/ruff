@@ -6,6 +6,7 @@ use crate::ProgramEnvironment;
 use crate::db::Db;
 use crate::types::IntersectionType;
 use crate::types::infer::InferenceFlags;
+use crate::types::string_ops::StringCaseOp;
 use crate::types::{
     CallableType, FunctionDecorators, InvalidTypeExpression, TypeDefinition, TypeQualifiers,
     generics::typing_self,
@@ -120,6 +121,16 @@ pub enum SpecialFormType {
     Length,
     /// The symbol `ty_extensions.Slice` (PEP 827 basic operator)
     Slice,
+    /// The symbol `ty_extensions.Uppercase` (PEP 827 string operator)
+    Uppercase,
+    /// The symbol `ty_extensions.Lowercase` (PEP 827 string operator)
+    Lowercase,
+    /// The symbol `ty_extensions.Capitalize` (PEP 827 string operator)
+    Capitalize,
+    /// The symbol `ty_extensions.Uncapitalize` (PEP 827 string operator)
+    Uncapitalize,
+    /// The symbol `ty_extensions.Concat` (PEP 827 string operator)
+    Concat,
     /// The symbol `ty_extensions.GetSpecialAttr` (PEP 827 basic operator)
     GetSpecialAttr,
     /// The symbol `ty_extensions.RaiseError` (PEP 827 type-level error)
@@ -168,6 +179,27 @@ pub enum SpecialFormType {
 }
 
 impl SpecialFormType {
+    /// The special form of a PEP 827 string case operator.
+    pub(crate) const fn from_string_case_op(op: StringCaseOp) -> Self {
+        match op {
+            StringCaseOp::Upper => Self::Uppercase,
+            StringCaseOp::Lower => Self::Lowercase,
+            StringCaseOp::Capitalize => Self::Capitalize,
+            StringCaseOp::Uncapitalize => Self::Uncapitalize,
+        }
+    }
+
+    /// The case transformation of a PEP 827 string case operator, if this is one.
+    pub(crate) const fn string_case_op(self) -> Option<StringCaseOp> {
+        match self {
+            Self::Uppercase => Some(StringCaseOp::Upper),
+            Self::Lowercase => Some(StringCaseOp::Lower),
+            Self::Capitalize => Some(StringCaseOp::Capitalize),
+            Self::Uncapitalize => Some(StringCaseOp::Uncapitalize),
+            _ => None,
+        }
+    }
+
     /// Return the [`KnownClass`] which this symbol is an instance of
     pub(crate) fn class(self, db: &dyn Db, env: &ProgramEnvironment<'_>) -> KnownClass {
         match self {
@@ -211,6 +243,11 @@ impl SpecialFormType {
             | Self::GetArgs
             | Self::Length
             | Self::Slice
+            | Self::Uppercase
+            | Self::Lowercase
+            | Self::Capitalize
+            | Self::Uncapitalize
+            | Self::Concat
             | Self::GetSpecialAttr
             | Self::RaiseError
             | Self::CallableTypeOf
@@ -381,6 +418,11 @@ impl SpecialFormType {
             GetArgs,
             Length,
             Slice,
+            Uppercase,
+            Lowercase,
+            Capitalize,
+            Uncapitalize,
+            Concat,
             GetSpecialAttr,
             RaiseError,
             TypeOf,
@@ -446,6 +488,11 @@ impl SpecialFormType {
                     SpecialFormType::GetArgs => Self::GetArgs,
                     SpecialFormType::Length => Self::Length,
                     SpecialFormType::Slice => Self::Slice,
+                    SpecialFormType::Uppercase => Self::Uppercase,
+                    SpecialFormType::Lowercase => Self::Lowercase,
+                    SpecialFormType::Capitalize => Self::Capitalize,
+                    SpecialFormType::Uncapitalize => Self::Uncapitalize,
+                    SpecialFormType::Concat => Self::Concat,
                     SpecialFormType::GetSpecialAttr => Self::GetSpecialAttr,
                     SpecialFormType::RaiseError => Self::RaiseError,
                     SpecialFormType::Literal => Self::Literal,
@@ -524,6 +571,11 @@ impl SpecialFormType {
                     SpecialFormTypeBuilder::GetArgs => &[Self::GetArgs],
                     SpecialFormTypeBuilder::Length => &[Self::Length],
                     SpecialFormTypeBuilder::Slice => &[Self::Slice],
+                    SpecialFormTypeBuilder::Uppercase => &[Self::Uppercase],
+                    SpecialFormTypeBuilder::Lowercase => &[Self::Lowercase],
+                    SpecialFormTypeBuilder::Capitalize => &[Self::Capitalize],
+                    SpecialFormTypeBuilder::Uncapitalize => &[Self::Uncapitalize],
+                    SpecialFormTypeBuilder::Concat => &[Self::Concat],
                     SpecialFormTypeBuilder::GetSpecialAttr => &[Self::GetSpecialAttr],
                     SpecialFormTypeBuilder::RaiseError => &[Self::RaiseError],
                     SpecialFormTypeBuilder::Literal => &[Self::Literal],
@@ -658,6 +710,11 @@ impl SpecialFormType {
             | Self::GetArgs
             | Self::Length
             | Self::Slice
+            | Self::Uppercase
+            | Self::Lowercase
+            | Self::Capitalize
+            | Self::Uncapitalize
+            | Self::Concat
             | Self::GetSpecialAttr
             | Self::RaiseError => module.is_ty_extensions(),
 
@@ -750,6 +807,11 @@ impl SpecialFormType {
             | Self::GetArgs
             | Self::Length
             | Self::Slice
+            | Self::Uppercase
+            | Self::Lowercase
+            | Self::Capitalize
+            | Self::Uncapitalize
+            | Self::Concat
             | Self::GetSpecialAttr
             | Self::RaiseError
             | Self::TypeOf
@@ -806,6 +868,11 @@ impl SpecialFormType {
             | Self::GetArgs
             | Self::Length
             | Self::Slice
+            | Self::Uppercase
+            | Self::Lowercase
+            | Self::Capitalize
+            | Self::Uncapitalize
+            | Self::Concat
             | Self::GetSpecialAttr
             | Self::RaiseError
             | Self::Literal
@@ -888,6 +955,11 @@ impl SpecialFormType {
             SpecialFormType::GetArgs => "GetArgs",
             SpecialFormType::Length => "Length",
             SpecialFormType::Slice => "Slice",
+            SpecialFormType::Uppercase => "Uppercase",
+            SpecialFormType::Lowercase => "Lowercase",
+            SpecialFormType::Capitalize => "Capitalize",
+            SpecialFormType::Uncapitalize => "Uncapitalize",
+            SpecialFormType::Concat => "Concat",
             SpecialFormType::GetSpecialAttr => "GetSpecialAttr",
             SpecialFormType::RaiseError => "RaiseError",
             SpecialFormType::TypeOf => "TypeOf",
@@ -957,6 +1029,11 @@ impl SpecialFormType {
             | SpecialFormType::GetArgs
             | SpecialFormType::Length
             | SpecialFormType::Slice
+            | SpecialFormType::Uppercase
+            | SpecialFormType::Lowercase
+            | SpecialFormType::Capitalize
+            | SpecialFormType::Uncapitalize
+            | SpecialFormType::Concat
             | SpecialFormType::GetSpecialAttr
             | SpecialFormType::RaiseError
             | SpecialFormType::Top
@@ -1125,6 +1202,7 @@ impl SpecialFormType {
             | Self::GetArg
             | Self::GetArgs
             | Self::Slice
+            | Self::Concat
             | Self::GetSpecialAttr => Err(InvalidTypeExpression::RequiresTwoArguments(self)),
 
             Self::Optional
@@ -1135,6 +1213,10 @@ impl SpecialFormType {
             | Self::Members
             | Self::FromUnion
             | Self::Length
+            | Self::Uppercase
+            | Self::Lowercase
+            | Self::Capitalize
+            | Self::Uncapitalize
             | Self::Top
             | Self::Bottom
             | Self::TypeOf

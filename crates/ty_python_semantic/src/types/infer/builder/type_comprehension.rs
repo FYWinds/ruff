@@ -654,6 +654,32 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 let kind = TypeOperatorKind::Slice(arguments[0], arguments[1], arguments[2]);
                 self.evaluate_type_operator(kind, subscript)
             }
+            SpecialFormType::Uppercase
+            | SpecialFormType::Lowercase
+            | SpecialFormType::Capitalize
+            | SpecialFormType::Uncapitalize => {
+                let Some(op) = special_form.string_case_op() else {
+                    unreachable!("`{special_form}` is a string case operator");
+                };
+                let Some(arguments) =
+                    self.infer_type_operator_arguments(subscript, special_form, 1)
+                else {
+                    return Type::unknown();
+                };
+                self.evaluate_type_operator(
+                    TypeOperatorKind::StringCase(op, arguments[0]),
+                    subscript,
+                )
+            }
+            SpecialFormType::Concat => {
+                let Some(arguments) =
+                    self.infer_type_operator_arguments(subscript, special_form, 2)
+                else {
+                    return Type::unknown();
+                };
+                let kind = TypeOperatorKind::Concat(arguments[0], arguments[1]);
+                self.evaluate_type_operator(kind, subscript)
+            }
             SpecialFormType::GetSpecialAttr => {
                 let Some(arguments) =
                     self.infer_type_operator_arguments(subscript, special_form, 2)

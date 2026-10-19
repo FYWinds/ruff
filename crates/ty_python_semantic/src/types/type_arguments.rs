@@ -9,11 +9,12 @@ use ty_module_resolver::file_to_module;
 use super::class::ClassType;
 use super::member_introspection::string_literal_type;
 use super::special_form::SpecialFormType;
+use super::string_ops::StringOperand;
 use super::tuple::{TupleSpec, TupleSpecBuilder, TupleType};
 use super::{ClassLiteral, KnownClass, LiteralValueType, Type};
 use crate::Db;
 use crate::ProgramEnvironment;
-use crate::subscript::PyIndex;
+use crate::subscript::{PyIndex, PySlice};
 
 /// An error from evaluating one of the operators in this module, as a message.
 pub(super) type EvaluationError = String;
@@ -261,7 +262,8 @@ fn slice_index<'db>(
     })))
 }
 
-/// Evaluates `Slice[sequence, start, end]` for non-union, non-dynamic arguments.
+/// Evaluates `Slice[sequence, start, end]` for non-union, non-dynamic arguments. The sequence is
+/// a tuple, or a string (sliced by code point like Python's `str`).
 pub(super) fn slice<'db>(
     db: &'db dyn Db,
     env: &ProgramEnvironment<'db>,
@@ -271,16 +273,29 @@ pub(super) fn slice<'db>(
 ) -> Result<Type<'db>, EvaluationError> {
     let start = slice_index(db, env, start, "start")?;
     let end = slice_index(db, env, end, "end")?;
-    let spec = sequence.tuple_instance_spec(db, env).ok_or_else(|| {
-        format!(
-            "`Slice` requires a tuple type, but got `{}`",
-            sequence.display(db, env)
-        )
-    })?;
     // The step is always `1`, so the slice cannot fail.
-    Ok(spec
-        .py_slice_type(db, env, start, end, None)
-        .unwrap_or_else(|_| Type::unknown()))
+    if let Some(spec) = sequence.tuple_instance_spec(db, env) {
+        return Ok(spec
+            .py_slice_type(db, env, start, end, None)
+            .unwrap_or_else(|_| Type::unknown()));
+    }
+    match StringOperand::classify(db, env, sequence) {
+        StringOperand::Literal(value) => {
+            let chars: Vec<char> = value.chars().collect();
+            let sliced: String = chars
+                .py_slice(db, start, end, None)
+                .map(Iterator::collect)
+                .unwrap_or_default();
+            Ok(string_literal_type(db, &sliced))
+        }
+        StringOperand::LiteralString => Ok(Type::literal_string()),
+        StringOperand::Str => Ok(KnownClass::Str.to_instance(db, env)),
+        StringOperand::Dynamic(dynamic) => Ok(dynamic),
+        StringOperand::Invalid => Err(format!(
+            "`Slice` requires a tuple or string type, but got `{}`",
+            sequence.display(db, env)
+        )),
+    }
 }
 
 /// The special class attributes that `GetSpecialAttr` supports.

@@ -2668,6 +2668,11 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             | SpecialFormType::GetArgs
             | SpecialFormType::Length
             | SpecialFormType::Slice
+            | SpecialFormType::Uppercase
+            | SpecialFormType::Lowercase
+            | SpecialFormType::Capitalize
+            | SpecialFormType::Uncapitalize
+            | SpecialFormType::Concat
             | SpecialFormType::GetSpecialAttr
             | SpecialFormType::RaiseError => {
                 self.infer_type_operator_special_form_type_expression(subscript, special_form)

@@ -10,6 +10,12 @@ use crate::types::{ClassLiteral, KnownClass, Type};
 use ty_python_core::definition::Definition;
 use ty_python_core::{place_table, use_def_map};
 
+/// How big a string literal type do we build before falling back to `LiteralString`?
+///
+/// This is a fairly arbitrary number. It should be *far* more than enough
+/// for most use cases, but we can reevaluate it later if useful.
+pub(crate) const MAX_STRING_LITERAL_SIZE: usize = 4096;
+
 /// A literal value. See [`LiteralValueTypeKind`] for details.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, get_size2::GetSize, salsa::SalsaValue)]
 pub struct LiteralValueType<'db>(LiteralValueTypeInner<'db>);

@@ -165,7 +165,7 @@ def _(
     a: Slice[tuple[int, str], int, None],
     # error: [invalid-type-form] "The end index of `Slice` must be an `int` literal type or `None`"
     b: Slice[tuple[int, str], Literal[0], Literal["1"]],
-    # error: [invalid-type-form] "`Slice` requires a tuple"
+    # error: [invalid-type-form] "`Slice` requires a tuple or string type, but got `list[int]`"
     c: Slice[list[int], Literal[0], None],
 ):
     reveal_type(a)  # revealed: Unknown

@@ -919,3 +919,192 @@ def f(
     pairs: tuple[tuple[int, float], tuple[str, bool]] = ok
     wrong: tuple[tuple[int, int], tuple[str, bool]] = ok  # error: [invalid-assignment]
 ```
+
+## String case operators
+
+[//]: # (playground: slug=capitalize, phase=4, ts="Uppercase<S> / Lowercase<S> / Capitalize<S> / Uncapitalize<S>")
+
+`Uppercase`, `Lowercase`, `Capitalize` and `Uncapitalize` change the case of a string literal type.
+They follow Python's string methods, with full Unicode case mapping. Note that `Capitalize` works
+like `str.capitalize` and lowercases the rest of the string, unlike TypeScript's `Capitalize`.
+
+```toml
+[environment]
+python-version = "3.14"
+```
+
+```py
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from ty_extensions import Capitalize, Lowercase, Uncapitalize, Uppercase
+
+def f(
+    a: Uppercase[Literal["straße"]],
+    b: Lowercase[Literal["ΟΔΟΣ"]],
+    c: Capitalize[Literal["fooBar"]],
+    d: Uncapitalize[Literal["FooBar"]],
+):
+    reveal_type(a)  # revealed: Literal["STRASSE"]
+    reveal_type(b)  # revealed: Literal["οδος"]
+    reveal_type(c)  # revealed: Literal["Foobar"]
+    reveal_type(d)  # revealed: Literal["fooBar"]
+```
+
+## Concatenation and unions
+
+[//]: # (playground: slug=concat, phase=4, ts="`btn-${Size}-${Color}`")
+
+`Concat[A, B]` concatenates two string literal types. Like TypeScript's template literal types, it is
+applied to every combination of union members. A non-literal `str` argument gives `str`.
+
+```toml
+[environment]
+python-version = "3.14"
+```
+
+```py
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from ty_extensions import Concat
+
+type Size = Literal["sm", "lg"]
+type Color = Literal["red", "blue"]
+type ClassName = Concat[Concat[Literal["btn-"], Size], Concat[Literal["-"], Color]]
+
+def f(name: ClassName, other: Concat[Literal["btn-"], str]):
+    reveal_type(name)  # revealed: Literal["btn-sm-red", "btn-sm-blue", "btn-lg-red", "btn-lg-blue"]
+    reveal_type(other)  # revealed: str
+```
+
+## Slicing strings
+
+[//]: # (playground: slug=string-slice, phase=4, ts="S extends `${infer Head}${infer Tail}` ? Head : never")
+
+`Slice[S, Start, End]` slices string literal types like Python's `s[start:end]`, by code point and
+with negative indices. Together with `Concat`, it can rebuild TypeScript's `Capitalize`, which only
+changes the first character.
+
+```toml
+[environment]
+python-version = "3.14"
+```
+
+```py
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from ty_extensions import Concat, Slice, Uppercase
+
+type Head[S] = Slice[S, Literal[0], Literal[1]]
+type Tail[S] = Slice[S, Literal[1], None]
+type TsCapitalize[S] = Concat[Uppercase[Head[S]], Tail[S]]
+
+def f(
+    a: Head[Literal["hello"]],
+    b: Slice[Literal["hello"], Literal[-3], None],
+    c: TsCapitalize[Literal["fooBar"]],
+):
+    reveal_type(a)  # revealed: Literal["h"]
+    reveal_type(b)  # revealed: Literal["llo"]
+    reveal_type(c)  # revealed: Literal["FooBar"]
+```
+
+## Getters
+
+[//]: # (playground: slug=getters, phase=4, ts="{ [K in keyof T as `get_${K & string}`]: ... }")
+
+String operators can compute member names. For every attribute `x` of a class, this protocol has a
+getter `get_x`, like key remapping with `as` in a TypeScript mapped type. This is the motivating
+use case of the PEP's string manipulation section.
+
+```toml
+[environment]
+python-version = "3.14"
+```
+
+```py
+from typing import TYPE_CHECKING, Callable, Literal
+
+if TYPE_CHECKING:
+    from ty_extensions import Attrs, Concat, Iter, Member, NewProtocol
+
+type Getters[T] = NewProtocol[
+    *[Member[Concat[Literal["get_"], p.name], Callable[[], p.type]] for p in Iter[Attrs[T]]]
+]
+
+class User:
+    name: str
+    age: int
+
+def f(user: Getters[User]):
+    reveal_type(user.get_name())  # revealed: str
+    reveal_type(user.get_age())  # revealed: int
+    user.get_email()  # error: [unresolved-attribute]
+```
+
+## Event names
+
+[//]: # (playground: slug=event-names, phase=4, ts="`on${Capitalize<keyof T & string>}Changed`")
+
+Combining `KeyOf` with string operators turns the attribute names of a class into a union of event
+names. Because of lifting, the operators are applied to each name separately.
+
+```toml
+[environment]
+python-version = "3.14"
+```
+
+```py
+from typing import TYPE_CHECKING, Literal, Union
+
+if TYPE_CHECKING:
+    from ty_extensions import Capitalize, Concat, Iter, Members
+
+type KeyOf[T] = Union[*[p.name for p in Iter[Members[T]]]]
+type ChangeEvent[T] = Concat[Literal["on"], Concat[Capitalize[KeyOf[T]], Literal["Changed"]]]
+
+class Person:
+    name: str
+    age: int
+
+def f(event: ChangeEvent[Person]):
+    reveal_type(event)  # revealed: Literal["onNameChanged", "onAgeChanged"]
+    ok: ChangeEvent[Person] = "onAgeChanged"
+    bad: ChangeEvent[Person] = "onEmailChanged"  # error: [invalid-assignment]
+```
+
+## snake_case to camelCase
+
+[//]: # (playground: slug=snake-to-camel, phase=4, ts="S extends `${infer H}_${infer T}` ? `${H}${Capitalize<SnakeToCamel<T>>}` : S")
+
+There is no operator that splits strings, but a recursive alias can walk through a string one
+character at a time with `Slice`: it drops each `_` and uppercases the character after it. Only the
+branch selected by the condition is evaluated, which is what makes the recursion stop.
+
+```toml
+[environment]
+python-version = "3.14"
+```
+
+```py
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from ty_extensions import Concat, IsEquivalent, Slice, Uppercase
+
+type Head[S] = Slice[S, Literal[0], Literal[1]]
+type Tail[S] = Slice[S, Literal[1], None]
+type SnakeToCamel[S] = (
+    S
+    if IsEquivalent[S, Literal[""]]
+    else Concat[Uppercase[Head[Tail[S]]], SnakeToCamel[Tail[Tail[S]]]]
+    if IsEquivalent[Head[S], Literal["_"]]
+    else Concat[Head[S], SnakeToCamel[Tail[S]]]
+)
+
+def f(a: SnakeToCamel[Literal["user_name"]], b: SnakeToCamel[Literal["created_at_utc"]]):
+    reveal_type(a)  # revealed: Literal["userName"]
+    reveal_type(b)  # revealed: Literal["createdAtUtc"]
+```

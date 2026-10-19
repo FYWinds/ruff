@@ -11,6 +11,7 @@ use crate::types::diagnostic::{
     DIVISION_BY_ZERO, report_unsupported_augmented_assignment, report_unsupported_binary_operation,
 };
 use crate::types::function::OverloadLiteral;
+use crate::types::literal::MAX_STRING_LITERAL_SIZE;
 use crate::types::set_theoretic::RecursivelyDefined;
 use crate::types::tuple::{TupleSpecBuilder, TupleType};
 use crate::types::typevar::TypeVarConstraints;
@@ -922,7 +923,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                         let lhs_value = lhs.value(db);
                         let rhs_value = rhs.value(db);
                         let new_length = lhs_value.len() + rhs_value.len();
-                        let ty = if new_length <= Self::MAX_STRING_LITERAL_SIZE {
+                        let ty = if new_length <= MAX_STRING_LITERAL_SIZE {
                             let mut value = CompactString::with_capacity(new_length);
                             value.push_str(lhs_value);
                             value.push_str(rhs_value);
@@ -953,9 +954,8 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                             Type::string_literal(db, "")
                         } else if let Ok(n) = usize::try_from(n.as_i64())
                             && let value = s.value(db)
-                            && n.checked_mul(value.len()).is_some_and(|new_length| {
-                                new_length <= Self::MAX_STRING_LITERAL_SIZE
-                            })
+                            && n.checked_mul(value.len())
+                                .is_some_and(|new_length| new_length <= MAX_STRING_LITERAL_SIZE)
                         {
                             let new_literal = value.repeat(n);
                             Type::string_literal(db, &*new_literal)

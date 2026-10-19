@@ -4,9 +4,11 @@ use camino::Utf8Path;
 thread_local! {
     // Restrict each fixture's Rayon work to one thread so concurrent tests do not compete for the
     // same resources. When fixtures share a process, the harness reuses worker threads, so cache
-    // one pool per worker.
+    // one pool per worker. Match the stack size of ty's production worker threads, so that deeply
+    // recursive fixtures (e.g. recursive PEP 827 type aliases) behave as they do in practice.
     static RAYON_POOL: rayon::ThreadPool = rayon::ThreadPoolBuilder::new()
         .num_threads(1)
+        .stack_size(ruff_db::STACK_SIZE)
         .build()
         .unwrap();
 }

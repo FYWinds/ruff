@@ -1189,6 +1189,8 @@ fn type_operator_precedence<'db>(db: &'db dyn Db, ty: Type<'db>) -> u8 {
             | TypeOperatorKind::GetArgs(..)
             | TypeOperatorKind::Length(_)
             | TypeOperatorKind::Slice(..)
+            | TypeOperatorKind::StringCase(..)
+            | TypeOperatorKind::Concat(..)
             | TypeOperatorKind::GetSpecialAttr(..)
             | TypeOperatorKind::RaiseError { .. }
             | TypeOperatorKind::Quantifier { .. } => 4,
@@ -1421,6 +1423,12 @@ fn fmt_type_operator<'db>(
         TypeOperatorKind::Length(ty) => special_form(f, SpecialFormType::Length, &[*ty]),
         TypeOperatorKind::Slice(sequence, start, end) => {
             special_form(f, SpecialFormType::Slice, &[*sequence, *start, *end])
+        }
+        TypeOperatorKind::StringCase(op, ty) => {
+            special_form(f, SpecialFormType::from_string_case_op(*op), &[*ty])
+        }
+        TypeOperatorKind::Concat(left, right) => {
+            special_form(f, SpecialFormType::Concat, &[*left, *right])
         }
         TypeOperatorKind::GetSpecialAttr(ty, attribute) => {
             special_form(f, SpecialFormType::GetSpecialAttr, &[*ty, *attribute])

@@ -547,6 +547,21 @@ impl<'db> TypeAliasType<'db> {
         db: &'db dyn Db,
         context: Option<&TypeRecursionContext<'db>>,
     ) -> Type<'db> {
+        let operator_specialization = self
+            .specialization(db)
+            .filter(|_| alias_has_type_operator(db, self));
+        // A recursive alias whose arguments stay flat (e.g. because an inline `Slice` evaluates
+        // to a plain literal at every step) is not caught by the depth limit below, but can
+        // still recurse once per character of a long string. Cut it off silently once too many
+        // such evaluations are active on this thread, before the stack overflows (PEP 827
+        // phase 4, Q7).
+        let _guard = match operator_specialization {
+            Some(_) => match ActiveOperatorAliasGuard::enter() {
+                Some(guard) => Some(guard),
+                None => return Type::unknown(),
+            },
+            None => None,
+        };
         if let Some(cycle) = AliasCycleSummary::from_type(db, Type::TypeAlias(self)).cycle {
             let env = ProgramEnvironment::from_definition(self.definition(db));
             return AliasCycleRecovery {
@@ -560,13 +575,12 @@ impl<'db> TypeAliasType<'db> {
         }
         // A recursive alias with type operators whose arguments keep growing never reaches a
         // base case: cut it off silently (PEP 827 phase 3, P24).
-        if let Some(specialization) = self.specialization(db)
+        if let Some(specialization) = operator_specialization
             && specialization_exceeds_operator_alias_depth(
                 db,
                 &ProgramEnvironment::from_definition(self.definition(db)),
                 specialization,
             )
-            && alias_has_type_operator(db, self)
         {
             return Type::unknown();
         }
@@ -965,6 +979,46 @@ impl std::fmt::Display for QualifiedTypeAliasName<'_> {
 /// The maximum nesting depth of the specialization arguments of a type alias that contains type
 /// operators, before its value is cut off to `Unknown` (PEP 827 phase 3, P24).
 const MAX_OPERATOR_ALIAS_DEPTH: usize = 64;
+
+/// The maximum number of nested evaluations of specialized type aliases that contain type
+/// operators that may be active on one thread, before the innermost one is cut off to `Unknown`
+/// (PEP 827 phase 4, Q7). Native threads run with [`ruff_db::STACK_SIZE`]; wasm has only the
+/// linker's default stack (1 MiB), where recursion past a few hundred levels overflows.
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_ACTIVE_OPERATOR_ALIASES: usize = 512;
+#[cfg(target_arch = "wasm32")]
+const MAX_ACTIVE_OPERATOR_ALIASES: usize = 64;
+
+std::thread_local! {
+    /// The number of evaluations of specialized type aliases with type operators that are
+    /// currently active on this thread. Salsa executes nested queries on the calling thread, so
+    /// this counts the nesting of the current query stack.
+    static ACTIVE_OPERATOR_ALIASES: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Counts one active evaluation of a specialized alias with type operators while alive.
+struct ActiveOperatorAliasGuard;
+
+impl ActiveOperatorAliasGuard {
+    /// Enters an evaluation, or returns `None` if [`MAX_ACTIVE_OPERATOR_ALIASES`] evaluations are
+    /// already active.
+    fn enter() -> Option<Self> {
+        ACTIVE_OPERATOR_ALIASES.with(|active| {
+            let count = active.get();
+            if count >= MAX_ACTIVE_OPERATOR_ALIASES {
+                return None;
+            }
+            active.set(count + 1);
+            Some(Self)
+        })
+    }
+}
+
+impl Drop for ActiveOperatorAliasGuard {
+    fn drop(&mut self) {
+        ACTIVE_OPERATOR_ALIASES.with(|active| active.set(active.get() - 1));
+    }
+}
 
 /// Returns `true` if the (unspecialized) value of `alias` contains a PEP 827 type operator or a
 /// raised error marker. Only such aliases are subject to the depth limit of recursive aliases,

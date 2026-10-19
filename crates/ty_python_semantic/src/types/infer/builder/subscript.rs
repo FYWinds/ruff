@@ -25,6 +25,7 @@ use crate::types::infer::{InferenceFlags, TypeExpressionFlags};
 use crate::types::special_form::AliasSpec;
 use crate::types::subscript::{LegacyGenericOrigin, SubscriptError, SubscriptErrorKind};
 use crate::types::tuple::{Tuple, TupleSpecBuilder, TupleType, VariableSegment};
+use crate::types::type_operator::{TypeOperatorKind, VariadicArg, is_unresolved_alias};
 use crate::types::typed_dict::{
     TypedDictAssignmentKind, TypedDictExtraItems, TypedDictKeyAssignment,
 };
@@ -62,6 +63,31 @@ fn string_literal_values<'db>(
                         .filter_map(|ty| ty.as_string_literal().map(|lit| lit.value(db))),
                 )
             })
+    }
+}
+
+/// Returns the type that an explicit type argument is checked as against the upper bound or
+/// constraints of its type variable.
+///
+/// A PEP 827 type operator that is not evaluated yet (its operands depend on the type variables
+/// of an enclosing generic alias or on a comprehension variable) can still evaluate to any type,
+/// down to `Never`, so where it appears at the top level (directly, through an unresolved alias,
+/// or as a union element) it is checked as `Never`, which satisfies every bound. Its actual value
+/// is only known once it is evaluated after specialization, and a bound violation found then is
+/// silent, like every failure that only shows up at specialization.
+fn eagerly_checked_type_argument<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    ty: Type<'db>,
+) -> Type<'db> {
+    let is_unevaluated_operator = |ty: Type<'db>| match ty {
+        Type::TypeOperator(operator) => !operator.kind(db).is_inert(),
+        _ => is_unresolved_alias(db, env, ty),
+    };
+    match ty {
+        Type::Union(union) => union.filter(db, |element| !is_unevaluated_operator(*element)),
+        _ if is_unevaluated_operator(ty) => Type::Never,
+        _ => ty,
     }
 }
 
@@ -804,6 +830,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             let mut tuple_builder = TupleSpecBuilder::with_capacity(
                 typevartuple_end.saturating_sub(typevartuple_index),
             );
+            // The same arguments as `tuple_builder`, for an unresolved PEP 827 `tuple[...]`
+            // operator in case an argument unpacks a sequence that is not known yet.
+            let mut variadic_arguments = Vec::new();
+            let mut unpacks_type_operator = false;
             for type_argument in
                 &expanded_type_arguments[..expanded_type_arguments.len().min(typevartuple_index)]
             {
@@ -819,6 +849,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     && let Some(variable_type) = variable.variable().homogeneous_type()
                 {
                     tuple_builder = tuple_builder.concat(db, env, &tuple);
+                    variadic_arguments.push(VariadicArg::Unpacked(provided_type));
                     packed.push(TypeArgument {
                         ty: Some(variable_type),
                         ..*type_argument
@@ -870,15 +901,30 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 let is_unpack = self
                     .type_expression_flags(type_argument.node)
                     .contains(TypeExpressionFlags::UNPACK);
-                if is_unpack && let Some(tuple) = provided_type.exact_tuple_instance_spec(db) {
+                if !is_unpack {
+                    tuple_builder.push(provided_type);
+                    variadic_arguments.push(VariadicArg::Single(provided_type));
+                } else if is_unresolved_alias(db, env, provided_type) {
+                    // An unresolved alias is not expanded (it may be recursive), see
+                    // `infer_tuple_type_expression_as_type`.
+                    unpacks_type_operator = true;
+                    variadic_arguments.push(VariadicArg::Unpacked(provided_type));
+                } else if let Some(tuple) = provided_type.exact_tuple_instance_spec(db) {
                     tuple_builder = tuple_builder.concat(db, env, &tuple);
-                } else if is_unpack
-                    && let Type::TypeVar(typevar) = provided_type
+                    variadic_arguments.push(VariadicArg::Unpacked(provided_type));
+                } else if let Type::TypeVar(typevar) = provided_type
                     && typevar.is_typevartuple(db)
                 {
                     tuple_builder = tuple_builder.concat_variadic_typevar(db, env, typevar);
+                    variadic_arguments.push(VariadicArg::Unpacked(provided_type));
+                } else if self.is_unpackable_type_operator(provided_type) {
+                    // A PEP 827 sequence that is not known yet (e.g. an unpacked comprehension
+                    // over a type variable) is spliced once it is evaluated.
+                    unpacks_type_operator = true;
+                    variadic_arguments.push(VariadicArg::Unpacked(provided_type));
                 } else {
                     tuple_builder.push(provided_type);
+                    variadic_arguments.push(VariadicArg::Single(provided_type));
                 }
             }
 
@@ -899,6 +945,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         && let Some(variable_type) = variable.variable().homogeneous_type()
                     {
                         tuple_builder = tuple_builder.concat(db, env, &tuple);
+                        variadic_arguments.push(VariadicArg::Unpacked(provided_type));
                         packed_suffix.push(TypeArgument {
                             ty: Some(variable_type),
                             ..*type_argument
@@ -932,11 +979,20 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             }
 
             if expanded_type_arguments.len() >= typevartuple_index {
+                let node = expanded_type_arguments
+                    .get(typevartuple_index)
+                    .map_or(slice_node, |argument| argument.node);
+                let ty = if unpacks_type_operator {
+                    self.evaluate_type_operator(
+                        TypeOperatorKind::TupleOf(variadic_arguments.into_boxed_slice()),
+                        node,
+                    )
+                } else {
+                    Type::tuple(TupleType::new(db, env, &tuple_builder.build()))
+                };
                 packed.push(TypeArgument {
-                    node: expanded_type_arguments
-                        .get(typevartuple_index)
-                        .map_or(slice_node, |argument| argument.node),
-                    ty: Some(Type::tuple(TupleType::new(db, env, &tuple_builder.build()))),
+                    node,
+                    ty: Some(ty),
                     source_index: expanded_type_arguments
                         .get(typevartuple_index)
                         .map_or(0, |argument| argument.source_index),
@@ -1053,9 +1109,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     } else {
                         provided_type
                     };
+                    let eagerly_checked_type =
+                        eagerly_checked_type_argument(db, env, type_to_check);
                     match bound_or_constraints {
                         Some(TypeVarBoundOrConstraints::UpperBound(bound)) => {
-                            if type_to_check
+                            if eagerly_checked_type
                                 .when_assignable_to(db, env, bound, &constraints, TypeVarSet::None)
                                 .is_never_satisfied(db, env, TypeVarSet::None)
                             {
@@ -1086,7 +1144,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             // to _at least one_ of the individual constraints, not to the union of
                             // all of them. `int | str` is not a valid specialization of a typevar
                             // constrained to `(int, str)`.
-                            if type_to_check
+                            if eagerly_checked_type
                                 .when_assignable_to(
                                     db,
                                     env,

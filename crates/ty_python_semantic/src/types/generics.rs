@@ -4644,6 +4644,13 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                         visitor,
                     );
                 }
+
+                // A protocol without a nominal origin (such as one synthesized by PEP 827
+                // `NewProtocol`) can only be compared structurally with a formal protocol.
+                if matches!(formal, Type::ProtocolInstance(_)) {
+                    let when = self.constraint_for_relation(formal, actual, relation_polarity);
+                    return self.infer_from_constraint_set(when);
+                }
             }
 
             // Each alternative in a tuple union contributes constraints. The element-wise

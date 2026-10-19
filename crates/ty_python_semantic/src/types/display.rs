@@ -2774,6 +2774,15 @@ impl<'db> DisplaySpecialization<'_, 'db> {
                     if wrote_any {
                         f.write_str(", ")?;
                     }
+                    // A deferred PEP 827 `tuple[...]` (e.g. one that unpacks a comprehension over
+                    // a type variable) stands for all the arguments of the `TypeVarTuple`.
+                    if matches!(
+                        ty,
+                        Type::TypeOperator(operator)
+                            if matches!(operator.kind(db), TypeOperatorKind::TupleOf(_))
+                    ) {
+                        f.write_char('*')?;
+                    }
                     ty.display_with(db, self.env, self.settings.clone())
                         .fmt_detailed(f)?;
                     wrote_any = true;

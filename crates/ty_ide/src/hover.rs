@@ -5942,6 +5942,67 @@ def function():
     }
 
     #[test]
+    fn hover_recursive_synthesized_protocol_member() {
+        let test = hover_test(
+            r#"
+        from typing import Literal
+        from ty_extensions import Member, NewProtocol
+
+        type Linked = NewProtocol[Member[Literal["next"], Linked], Member[Literal["value"], int]]
+
+        def walk(node: Linked):
+            node.next.ne<CURSOR>xt.value
+        "#,
+        );
+
+        assert_snapshot!(test.hover(), @"
+        <Protocol with members 'next', 'value'>
+        ---------------------------------------------
+        ```xml
+        <Protocol with members 'next', 'value'>
+        ```
+        ---------------------------------------------
+        info[hover]: Hovered content is
+         --> main.py:8:15
+          |
+        8 |     node.next.next.value
+          |               ^^-^
+          |               | |
+          |               | Cursor offset
+          |               source
+        ");
+    }
+
+    #[test]
+    fn hover_recursive_synthesized_alias_name() {
+        let test = hover_test(
+            r#"
+        from typing import Literal
+        from ty_extensions import Member, NewProtocol
+
+        type Lin<CURSOR>ked = NewProtocol[Member[Literal["next"], Linked], Member[Literal["value"], int]]
+        "#,
+        );
+
+        assert_snapshot!(test.hover(), @r#"
+        type Linked = <Protocol with members 'next', 'value'>
+        ---------------------------------------------
+        ```python
+        type Linked = <Protocol with members 'next', 'value'>
+        ```
+        ---------------------------------------------
+        info[hover]: Hovered content is
+         --> main.py:5:6
+          |
+        5 | type Linked = NewProtocol[Member[Literal["next"], Linked], Member[Literal["value"], int]]
+          |      ^^^-^^
+          |      |  |
+          |      |  Cursor offset
+          |      source
+        "#);
+    }
+
+    #[test]
     fn hover_implicit_recursive_alias_value() {
         let test = hover_test(
             r#"

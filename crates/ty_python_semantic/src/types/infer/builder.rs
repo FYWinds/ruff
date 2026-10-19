@@ -5767,6 +5767,16 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             }
         };
 
+        // A PEP 827 `RaiseError` selected by the specialization of the decorator's return type is
+        // reported at the decorator, as at a direct call (unless it only passes through an error in
+        // the type of the decorated definition).
+        report_raised_type_errors_except(
+            &self.context,
+            &decorator_node.expression,
+            return_ty,
+            || find_raised_errors(db, env, decorated_ty),
+        );
+
         // TODO: Remove this special case once the new constraint solver can preserve
         // per-overload ParamSpec/return correlations for transparent callable decorators.
         if let Some(decorator_bindings) = decorator_bindings.as_ref()
@@ -5792,6 +5802,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 .is_lint_enabled(&DYNAMIC_FUNCTION_DECORATOR_RETURN)
             && inferred_ty.is_equivalent_to(db, env, Type::any())
             && !decorated_ty.is_equivalent_to(db, env, Type::any())
+            // A raised type error is reported above instead.
+            && find_raised_errors(db, env, return_ty).is_empty()
         {
             report_dynamic_function_decorator_return(
                 &self.context,

@@ -1202,6 +1202,35 @@ impl<'db> BoundTypeVarInstance<'db> {
         self.identity(db) == other.identity(db)
     }
 
+    /// Returns an occurrence of this type variable (with the same name, bounds and binding
+    /// context) whose identity differs from every occurrence of the same type variable in
+    /// `taken`: its freshness nonce is greater than all of theirs and its own.
+    pub(crate) fn freshened_beyond(
+        self,
+        db: &'db dyn Db,
+        taken: impl IntoIterator<Item = BoundTypeVarIdentity<'db>>,
+    ) -> Self {
+        let mut base = self.identity(db);
+        base.freshness = TypeVarNonce::NONE;
+        let freshness = taken
+            .into_iter()
+            .filter(|identity| {
+                let mut identity = *identity;
+                identity.freshness = TypeVarNonce::NONE;
+                identity == base
+            })
+            .map(|identity| identity.freshness)
+            .fold(self.freshness(db), Ord::max)
+            .increment();
+        Self::new(
+            db,
+            self.typevar(db),
+            self.binding_context(db),
+            self.paramspec_attr(db),
+            freshness,
+        )
+    }
+
     /// Create a new PEP 695 type variable that can be used in signatures
     /// of synthetic generic functions.
     pub(crate) fn synthetic(

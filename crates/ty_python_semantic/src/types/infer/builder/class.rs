@@ -7,6 +7,7 @@ use crate::types::{
         ClassDecoratorInfo,
         update_class::{UpdateClassDecorator, update_class_decorator},
     },
+    diagnostic::report_raised_type_errors_except,
     function::{KnownFunction, OverloadLiteral},
     infer::{
         TypeInferenceBuilder,
@@ -14,6 +15,7 @@ use crate::types::{
         original_class_type,
     },
     special_form::TypeQualifier,
+    type_operator::find_raised_errors,
 };
 use ruff_python_ast::{self as ast, helpers::any_over_expr};
 use ty_module_resolver::{ImportingFile, KnownModule, file_to_module};
@@ -406,6 +408,15 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                     return_type
                 }
             };
+            // A PEP 827 `RaiseError` selected by the specialization of the decorator's return type
+            // is reported at the decorator, as at a direct call (unless it only passes through an
+            // error in the type of the decorated class).
+            report_raised_type_errors_except(
+                &self.context,
+                &decorator_node.expression,
+                decorated_ty,
+                || find_raised_errors(db, env, inferred_ty),
+            );
             let decorated_ty = match decorated_ty {
                 Type::DataclassDecorator(_) | Type::DataclassTransformer(_) => Type::unknown(),
                 decorated_ty => decorated_ty,

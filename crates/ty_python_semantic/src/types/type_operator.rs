@@ -29,8 +29,10 @@
 //! [PEP 827]: https://peps.python.org/pep-0827/
 
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 
 use ruff_python_ast::name::Name;
+use rustc_hash::FxHashSet;
 
 use super::callable::walk_callable_type;
 use super::class::update_class;
@@ -859,6 +861,251 @@ impl<'db> visitor::TypeVisitor<'db> for FreeTypeVarVisitor<'db, '_> {
     }
 }
 
+/// The type variables that occur in some types. The values of type aliases are not visited, only
+/// their arguments (like [`needs_deferral`]).
+struct TypeVarOccurrences<'db, 'a> {
+    env: &'a ProgramEnvironment<'db>,
+    /// The type variables bound by the binders (of comprehensions, generic callables and callable
+    /// signatures) that are currently being visited.
+    bound: RefCell<Vec<BoundTypeVarIdentity<'db>>>,
+    recursion_guard: TypeCollector<'db>,
+    /// The free type variables, without duplicates.
+    free: RefCell<Vec<BoundTypeVarInstance<'db>>>,
+    /// The identities of all type variables, free or bound, including those of the binders.
+    all: RefCell<Vec<BoundTypeVarIdentity<'db>>>,
+}
+
+impl<'db, 'a> TypeVarOccurrences<'db, 'a> {
+    /// Collects the type variables of `types`, in the scope of `binders`.
+    fn collect(
+        db: &'db dyn Db,
+        env: &'a ProgramEnvironment<'db>,
+        types: impl IntoIterator<Item = Type<'db>>,
+        binders: &[BoundTypeVarInstance<'db>],
+    ) -> Self {
+        let occurrences = Self {
+            env,
+            bound: RefCell::default(),
+            recursion_guard: TypeCollector::default(),
+            free: RefCell::default(),
+            all: RefCell::default(),
+        };
+        occurrences.with_binders(binders.iter().map(|binder| binder.identity(db)), || {
+            for ty in types {
+                occurrences.visit_type(db, ty);
+            }
+        });
+        occurrences
+    }
+
+    fn with_binders(
+        &self,
+        binders: impl IntoIterator<Item = BoundTypeVarIdentity<'db>>,
+        walk: impl FnOnce(),
+    ) {
+        let depth = self.bound.borrow().len();
+        for binder in binders {
+            self.all.borrow_mut().push(binder);
+            self.bound.borrow_mut().push(binder);
+        }
+        walk();
+        self.bound.borrow_mut().truncate(depth);
+    }
+
+    fn with_signature_binders(
+        &self,
+        db: &'db dyn Db,
+        signatures: &CallableSignature<'db>,
+        walk: impl FnOnce(),
+    ) {
+        let binders: Vec<_> = signatures
+            .iter()
+            .filter_map(|signature| signature.generic_context)
+            .flat_map(|context| context.variables(db))
+            .map(|typevar| typevar.identity(db))
+            .collect();
+        self.with_binders(binders, walk);
+    }
+}
+
+impl<'db> visitor::TypeVisitor<'db> for TypeVarOccurrences<'db, '_> {
+    fn program_environment(&self) -> &ProgramEnvironment<'db> {
+        self.env
+    }
+
+    fn should_visit_lazy_type_attributes(&self) -> bool {
+        false
+    }
+
+    fn visit_type(&self, db: &'db dyn Db, ty: Type<'db>) {
+        match ty {
+            Type::TypeVar(typevar) => {
+                let typevar = if typevar.paramspec_attr(db).is_some() {
+                    typevar.without_paramspec_attr(db)
+                } else {
+                    typevar
+                };
+                let identity = typevar.identity(db);
+                self.all.borrow_mut().push(identity);
+                if !self.bound.borrow().contains(&identity)
+                    && !self
+                        .free
+                        .borrow()
+                        .iter()
+                        .any(|free| free.is_same_typevar_as(db, typevar))
+                {
+                    self.free.borrow_mut().push(typevar);
+                }
+            }
+            Type::TypeOperator(operator) => match operator.kind(db) {
+                TypeOperatorKind::UnpackMap {
+                    iterable,
+                    binder,
+                    body,
+                    conditions,
+                } => {
+                    self.visit_type(db, *iterable);
+                    self.with_binders([binder.identity(db)], || {
+                        for condition in conditions {
+                            self.visit_type(db, *condition);
+                        }
+                        self.visit_type(db, body.ty());
+                    });
+                }
+                TypeOperatorKind::GenericCallable { binders, body } => {
+                    self.with_binders(binders.iter().map(|binder| binder.identity(db)), || {
+                        self.visit_type(db, *body);
+                    });
+                }
+                _ => walk_type_operator_type(db, operator, self),
+            },
+            Type::TypeAlias(alias) => {
+                if let Some(specialization) = alias.specialization(db) {
+                    walk_specialization_types(db, specialization, self);
+                }
+            }
+            _ => visitor::walk_type_with_recursion_guard(db, ty, self, &self.recursion_guard),
+        }
+    }
+
+    fn visit_callable_type(&self, db: &'db dyn Db, callable: CallableType<'db>) {
+        self.with_signature_binders(db, callable.signatures(db), || {
+            walk_callable_type(db, callable, self);
+        });
+    }
+
+    fn visit_function_type(&self, db: &'db dyn Db, function: FunctionType<'db>) {
+        self.with_signature_binders(db, function.signature(db), || {
+            walk_function_type(db, function, self);
+        });
+    }
+}
+
+/// How a type mapping applies to the scope of the binders that an operator introduces (the body
+/// and conditions of an unpacked comprehension, or the body of a generic callable).
+///
+/// Comprehension binders with the same name share an identity, so substitution must avoid
+/// capture: when a mapping replaces a type variable of the scope by a type that mentions one of
+/// the binders (e.g. the argument `GetMemberType[M, c.name]` of a recursive alias whose body
+/// iterates with `c` itself), that binder is renamed to a fresh type variable with the same name
+/// before the scope is mapped.
+enum BinderScopeMapping<'db> {
+    /// The mapping substitutes a binder, but nothing else in the scope: the scope is kept as is
+    /// (the binders shadow the substituted type variables).
+    Shadowed,
+    /// The scope is mapped, with these binders in place of the original ones: a binder that the
+    /// mapping would substitute or capture is replaced by a fresh one.
+    Map(Vec<BoundTypeVarInstance<'db>>),
+}
+
+impl<'db> BinderScopeMapping<'db> {
+    fn new(
+        db: &'db dyn Db,
+        binders: &[BoundTypeVarInstance<'db>],
+        scope: &[Type<'db>],
+        type_mapping: &TypeMapping<'_, 'db>,
+        visitor: &ApplyTypeMappingVisitor<'_, 'db>,
+    ) -> Self {
+        let env = visitor.env;
+        // The type that the mapping replaces `typevar` by, if any. (A mapping may also keep a
+        // type variable but change its bounds, e.g. when materializing.)
+        let image = |typevar: BoundTypeVarInstance<'db>| {
+            let mapped = Type::TypeVar(typevar).apply_type_mapping_impl(
+                db,
+                type_mapping,
+                TypeContext::default(),
+                visitor,
+            );
+            let unchanged = mapped
+                .as_typevar()
+                .is_some_and(|mapped| mapped.is_same_typevar_as(db, typevar));
+            (!unchanged).then_some(mapped)
+        };
+        let substitutes = |typevar: BoundTypeVarInstance<'db>| image(typevar).is_some();
+
+        let in_scope = TypeVarOccurrences::collect(db, env, scope.iter().copied(), binders);
+        let images: Vec<_> = in_scope
+            .free
+            .borrow()
+            .iter()
+            .filter_map(|typevar| image(*typevar))
+            .collect();
+        let shadowed: Vec<bool> = binders.iter().map(|binder| substitutes(*binder)).collect();
+        if images.is_empty() {
+            return if shadowed.contains(&true) {
+                Self::Shadowed
+            } else {
+                Self::Map(binders.to_vec())
+            };
+        }
+
+        let introduced = TypeVarOccurrences::collect(db, env, images, &[]);
+        let introduced_free = introduced.free.into_inner();
+        let taken: Vec<_> = in_scope
+            .all
+            .into_inner()
+            .into_iter()
+            .chain(introduced.all.into_inner())
+            .collect();
+        Self::Map(
+            binders
+                .iter()
+                .zip(shadowed)
+                .map(|(binder, shadowed)| {
+                    let captures = introduced_free
+                        .iter()
+                        .any(|typevar| typevar.is_same_typevar_as(db, *binder));
+                    if !shadowed && !captures {
+                        return *binder;
+                    }
+                    let mut fresh = binder.freshened_beyond(db, taken.iter().copied());
+                    while substitutes(fresh) {
+                        fresh = fresh.freshened_beyond(db, std::iter::empty());
+                    }
+                    fresh
+                })
+                .collect(),
+        )
+    }
+}
+
+/// Replaces each of `binders` in `ty` by the corresponding one of `renamed`.
+fn rename_binders<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    ty: Type<'db>,
+    binders: &[BoundTypeVarInstance<'db>],
+    renamed: &[BoundTypeVarInstance<'db>],
+) -> Type<'db> {
+    binders
+        .iter()
+        .zip(renamed)
+        .filter(|(binder, renamed)| binder != renamed)
+        .fold(ty, |ty, (binder, renamed)| {
+            ty.substitute_one_typevar(db, env, *binder, Type::TypeVar(*renamed))
+        })
+}
+
 fn type_bool<'db>(value: bool) -> Type<'db> {
     Type::LiteralValue(LiteralValueType::unpromotable(value))
 }
@@ -968,12 +1215,14 @@ fn concat_unpacked<'db>(
     })
 }
 
-/// Returns the raised errors (`DynamicType::RaisedError`) in `ty`, in order and without
-/// duplicates, for reporting where a type is used.
+/// Returns the raised errors (`DynamicType::RaisedError`) in `ty`, without duplicates, for
+/// reporting where a type is used.
 ///
 /// The values of type aliases are searched if they contain type operators (see
 /// [`alias_has_type_operator`]). Unresolved operators are not searched: an error in them has not
-/// been raised yet.
+/// been raised yet. Alias values are searched one after another rather than nested: a structure
+/// synthesized by `NewProtocol`/`NewTypedDict` refers to the aliases of its members lazily, and a
+/// chain of such aliases can be long.
 pub(crate) fn find_raised_errors<'db>(
     db: &'db dyn Db,
     env: &ProgramEnvironment<'db>,
@@ -982,7 +1231,9 @@ pub(crate) fn find_raised_errors<'db>(
     struct RaisedErrorVisitor<'db, 'a> {
         env: &'a ProgramEnvironment<'db>,
         recursion_guard: TypeCollector<'db>,
-        seen_aliases: RefCell<Vec<TypeAliasType<'db>>>,
+        seen_aliases: RefCell<FxHashSet<TypeAliasType<'db>>>,
+        /// The values of aliases that remain to be searched, in the order they were found.
+        pending: RefCell<VecDeque<Type<'db>>>,
         found: RefCell<Vec<RaisedErrorType<'db>>>,
     }
 
@@ -1008,12 +1259,11 @@ pub(crate) fn find_raised_errors<'db>(
                 }
                 Type::TypeOperator(_) => {}
                 Type::TypeAlias(alias) => {
-                    if self.seen_aliases.borrow().contains(&alias) {
+                    if !self.seen_aliases.borrow_mut().insert(alias) {
                         return;
                     }
-                    self.seen_aliases.borrow_mut().push(alias);
                     if alias_has_type_operator(db, alias) {
-                        self.visit_type(db, alias.value_type(db));
+                        self.pending.borrow_mut().push_back(alias.value_type(db));
                     } else if let Some(specialization) = alias.specialization(db) {
                         walk_specialization_types(db, specialization, self);
                     }
@@ -1027,9 +1277,17 @@ pub(crate) fn find_raised_errors<'db>(
         env,
         recursion_guard: TypeCollector::default(),
         seen_aliases: RefCell::default(),
+        pending: RefCell::default(),
         found: RefCell::default(),
     };
     visitor.visit_type(db, ty);
+    loop {
+        let next = visitor.pending.borrow_mut().pop_front();
+        let Some(next) = next else {
+            break;
+        };
+        visitor.visit_type(db, next);
+    }
     visitor.found.into_inner()
 }
 
@@ -1038,7 +1296,8 @@ pub(crate) fn find_raised_errors<'db>(
 ///
 /// Binders with the same name share an identity; nested comprehensions are kept apart by
 /// shadowing (a type mapping never substitutes a comprehension's own binder in its body or
-/// conditions).
+/// conditions) and by capture-avoiding substitution (a binder that a mapping would capture is
+/// renamed, see [`BinderScopeMapping`]).
 pub(crate) fn comprehension_binder<'db>(
     db: &'db dyn Db,
     env: &ProgramEnvironment<'db>,
@@ -2214,10 +2473,11 @@ impl<'db> TypeOperatorType<'db> {
     /// (e.g. the branches of a conditional type): the inputs of computations are compared as
     /// written, so that (for example) promoting `Bool[Literal[True]]` does not change its value.
     ///
-    /// A mapping never substitutes the binder of an unpacked comprehension in that
-    /// comprehension's body or conditions (the binder shadows any outer binder with the same
-    /// identity); the iterable is still mapped. Likewise, a generic callable whose binders a
-    /// mapping would substitute is kept unchanged.
+    /// A mapping never substitutes the binder of an unpacked comprehension (or the binders of a
+    /// generic callable) in its scope: the binder shadows any outer type variable with the same
+    /// identity, while the iterable is still mapped. Substitution avoids capture: a binder that
+    /// would capture a type variable introduced by the mapping is renamed first (see
+    /// [`BinderScopeMapping`]).
     pub(super) fn apply_type_mapping_impl<'a>(
         self,
         db: &'db dyn Db,
@@ -2254,18 +2514,27 @@ impl<'db> TypeOperatorType<'db> {
                     binder,
                     body,
                     conditions,
-                } if Type::TypeVar(*binder).apply_type_mapping_impl(
-                    db,
-                    type_mapping,
-                    TypeContext::default(),
-                    visitor,
-                ) != Type::TypeVar(*binder) =>
-                {
-                    TypeOperatorKind::UnpackMap {
-                        iterable: map(*iterable, OperandRole::Input),
-                        binder: *binder,
-                        body: *body,
-                        conditions: conditions.clone(),
+                } => {
+                    let scope: Vec<_> = conditions.iter().copied().chain([body.ty()]).collect();
+                    match BinderScopeMapping::new(db, &[*binder], &scope, type_mapping, visitor) {
+                        BinderScopeMapping::Shadowed => TypeOperatorKind::UnpackMap {
+                            iterable: map(*iterable, OperandRole::Input),
+                            binder: *binder,
+                            body: *body,
+                            conditions: conditions.clone(),
+                        },
+                        BinderScopeMapping::Map(renamed) => {
+                            let rename = |ty| rename_binders(db, env, ty, &[*binder], &renamed);
+                            TypeOperatorKind::UnpackMap {
+                                iterable: map(*iterable, OperandRole::Input),
+                                binder: renamed[0],
+                                body: body.with_ty(map(rename(body.ty()), OperandRole::Output)),
+                                conditions: conditions
+                                    .iter()
+                                    .map(|condition| map(rename(*condition), OperandRole::Input))
+                                    .collect(),
+                            }
+                        }
                     }
                 }
                 // Only the branch selected by the mapped condition is mapped, so that a
@@ -2319,17 +2588,17 @@ impl<'db> TypeOperatorType<'db> {
                 }
                 // The binders of a generic callable are local to it, like the binder of an
                 // unpacked comprehension.
-                TypeOperatorKind::GenericCallable { binders, .. }
-                    if binders.iter().any(|binder| {
-                        Type::TypeVar(*binder).apply_type_mapping_impl(
-                            db,
-                            type_mapping,
-                            TypeContext::default(),
-                            visitor,
-                        ) != Type::TypeVar(*binder)
-                    }) =>
-                {
-                    return Type::TypeOperator(self);
+                TypeOperatorKind::GenericCallable { binders, body } => {
+                    match BinderScopeMapping::new(db, binders, &[*body], type_mapping, visitor) {
+                        BinderScopeMapping::Shadowed => return Type::TypeOperator(self),
+                        BinderScopeMapping::Map(renamed) => TypeOperatorKind::GenericCallable {
+                            body: map(
+                                rename_binders(db, env, *body, binders, &renamed),
+                                OperandRole::Output,
+                            ),
+                            binders: renamed.into_boxed_slice(),
+                        },
+                    }
                 }
                 kind => kind
                     .try_map(|ty, role| Some(map(ty, role)))
@@ -2433,5 +2702,74 @@ impl<'db> VarianceInferable<'db> for TypeOperatorType<'db> {
             });
         });
         VarianceTerm::join(db, terms)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ruff_python_ast::name::Name;
+
+    use super::{TypeOperatorKind, TypeOperatorType, VariadicArg, comprehension_binder};
+    use crate::db::tests::setup_db;
+    use crate::types::{BoundTypeVarInstance, KnownClass, Type, TypeVarVariance};
+
+    /// Substituting an outer comprehension binder `c` for `M` in `*[tuple[M, c] for c in Iter[M]]`
+    /// renames the inner binder (keeping its name) instead of capturing the outer `c`.
+    #[test]
+    fn substitution_into_comprehension_avoids_capture() {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let c = comprehension_binder(db, &env, Name::new_static("c"));
+        let m = BoundTypeVarInstance::synthetic(
+            db,
+            &env,
+            Name::new_static("M"),
+            TypeVarVariance::Invariant,
+        );
+        let comprehension = Type::TypeOperator(TypeOperatorType::new(
+            db,
+            TypeOperatorKind::UnpackMap {
+                iterable: Type::TypeVar(m),
+                binder: c,
+                body: VariadicArg::Single(Type::heterogeneous_tuple(
+                    db,
+                    &env,
+                    [Type::TypeVar(m), Type::TypeVar(c)],
+                )),
+                conditions: Box::default(),
+            },
+        ));
+
+        let substituted = comprehension.substitute_one_typevar(db, &env, m, Type::TypeVar(c));
+        let Type::TypeOperator(operator) = substituted else {
+            panic!("expected an unresolved comprehension");
+        };
+        let TypeOperatorKind::UnpackMap {
+            iterable,
+            binder,
+            body,
+            ..
+        } = operator.kind(db)
+        else {
+            panic!("expected an unresolved comprehension");
+        };
+        assert_eq!(*iterable, Type::TypeVar(c));
+        assert!(!binder.is_same_typevar_as(db, c));
+        assert_eq!(binder.name(db), c.name(db));
+        assert_eq!(
+            body.ty(),
+            Type::heterogeneous_tuple(db, &env, [Type::TypeVar(c), Type::TypeVar(*binder)])
+        );
+
+        // Binding the outer `c` evaluates the comprehension over the elements it is bound to.
+        let int = KnownClass::Int.to_instance(db, &env);
+        let str = KnownClass::Str.to_instance(db, &env);
+        let elements = Type::heterogeneous_tuple(db, &env, [int, str]);
+        let pair = |element| Type::heterogeneous_tuple(db, &env, [elements, element]);
+        assert_eq!(
+            substituted.substitute_one_typevar(db, &env, c, elements),
+            Type::heterogeneous_tuple(db, &env, [pair(int), pair(str)])
+        );
     }
 }

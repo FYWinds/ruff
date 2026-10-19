@@ -1956,3 +1956,89 @@ fn call_type_doesnt_rerun_when_only_callee_changed() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// Evaluating synthesized structures level by level eagerly overflowed a 1 MiB stack at about 60
+/// levels.
+const LONG_SYNTHESIZED_CHAIN: usize = 300;
+
+/// Recursive types synthesized by PEP 827 `NewProtocol`/`NewTypedDict` refer back to their alias
+/// lazily, so checking them never recurses through the cycle or through a long chain of
+/// specializations. They must fit in the 1 MiB stack of the wasm playground.
+#[test]
+fn recursive_synthesized_types_fit_in_a_small_stack() -> anyhow::Result<()> {
+    let handle = std::thread::Builder::new()
+        .name("recursive-synthesis-stack-test".into())
+        .stack_size(1024 * 1024)
+        .spawn(|| {
+            let mut db = TestDbBuilder::new()
+                .with_python_version(PythonVersion::PY314)
+                .build()?;
+            db.write_dedented(
+                "/src/shapes.py",
+                r#"
+                from typing import Literal
+                from ty_extensions import Attrs, IsAssignable, Iter, Member, NewProtocol, NewTypedDict
+
+                type Linked = NewProtocol[Member[Literal["next"], Linked], Member[Literal["value"], int]]
+                type Same = NewProtocol[Member[Literal["next"], Same], Member[Literal["value"], int]]
+                type Dict = NewTypedDict[Member[Literal["next"], Dict], Member[Literal["value"], int]]
+                type Ping = NewProtocol[Member[Literal["pong"], Pong], Member[Literal["value"], int]]
+                type Pong = NewProtocol[Member[Literal["ping"], Ping]]
+
+                class Node:
+                    next: Node
+                    value: int
+
+                type Tree[T] = NewProtocol[
+                    *[Member[c.name, Tree[c.type] if IsAssignable[c.type, Node] else c.type] for c in Iter[Attrs[T]]]
+                ]
+                "#,
+            )?;
+            let cases = [
+                ("x: Linked", "x.next.next.value"),
+                ("x: Linked, y: Same", "(y := x).next.value"),
+                ("x: Dict", "x['next']['next']['value']"),
+                ("x: Ping", "x.pong.ping.pong.ping.value"),
+                ("x: Tree[Node]", "x.next.next.value"),
+            ];
+            for (index, (parameters, expression)) in cases.into_iter().enumerate() {
+                let path = format!("/src/use_{index}.py");
+                db.write_dedented(
+                    &path,
+                    &format!(
+                        r#"
+                        from typing_extensions import reveal_type
+                        from shapes import *
+
+                        def f({parameters}):
+                            reveal_type({expression})
+                        "#
+                    ),
+                )?;
+                assert_revealed_type(&db, &path, "int");
+            }
+
+            // A recursive alias over a long chain of classes: the members refer to the alias of
+            // the next level lazily, so evaluating one level does not evaluate the rest.
+            let mut chain = String::from(
+                "from typing_extensions import reveal_type\nfrom ty_extensions import Attrs, IsAssignable, Iter, Member, NewProtocol\n\n",
+            );
+            for index in 0..LONG_SYNTHESIZED_CHAIN {
+                writeln!(chain, "class C{index}:\n    x: C{}\n    v: int\n", index + 1)?;
+            }
+            writeln!(chain, "class C{LONG_SYNTHESIZED_CHAIN}:\n    v: int\n")?;
+            chain.push_str(concat!(
+                "type Deep[T] = NewProtocol[\n",
+                "    *[Member[c.name, c.type if IsAssignable[c.type, int] else Deep[c.type]] for c in Iter[Attrs[T]]]\n",
+                "]\n\n",
+                "def f(d: Deep[C0]):\n",
+                "    reveal_type(d.x.x.v)\n",
+            ));
+            db.write_file("/src/chain.py", &chain)?;
+            assert_revealed_type(&db, "/src/chain.py", "int");
+
+            Ok(())
+        })?;
+
+    handle.join().expect("regression test thread panicked")
+}

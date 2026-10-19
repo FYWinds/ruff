@@ -1,5 +1,5 @@
 use crate::ProgramEnvironment;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::fmt::Write;
 
 use crate::{
@@ -13,6 +13,7 @@ use crate::{
         definition_expression_type,
         display::{QualifiedNameStyle, qualified_name_components_from_scope},
         generics::{ApplySpecialization, Specialization, bind_typevar, walk_specialization_types},
+        type_operator::{TypeOperatorKind, needs_deferral},
         variance::{VarianceInferable, VarianceOrigin},
         visitor,
     },
@@ -26,6 +27,7 @@ use ty_python_core::{
 use ruff_db::parsed::parsed_module;
 use ruff_python_ast::name::Name;
 use ruff_python_ast::{self as ast};
+use salsa::plumbing::AsId;
 
 impl<'db> Type<'db> {
     /// Returns whether expanding aliases, unions, and intersections can return to the same alias
@@ -556,7 +558,7 @@ impl<'db> TypeAliasType<'db> {
         // such evaluations are active on this thread, before the stack overflows (PEP 827
         // phase 4, Q7).
         let _guard = match operator_specialization {
-            Some(_) => match ActiveOperatorAliasGuard::enter() {
+            Some(_) => match ActiveOperatorAliasGuard::enter(self) {
                 Some(guard) => Some(guard),
                 None => return Type::unknown(),
             },
@@ -785,6 +787,36 @@ impl<'db> TypeAliasType<'db> {
                         )
                 }))
             }
+            // Any other substitution of type variables (such as a comprehension binder replaced by
+            // an element of the iterable) is applied to the arguments of a specialized alias with
+            // type operators, too: the value of such an alias is computed from its arguments.
+            // Mapping its expanded value instead would leave the recursive references of a
+            // recursive alias unmapped (the visitor stops at a reference to an alias definition
+            // that is already being mapped), so that they would stay unresolved for good.
+            //
+            // Once its arguments are fully known, the alias is replaced by its value, as if its
+            // value had been mapped. It is kept as an alias while its value is still unresolved,
+            // and as a recursive reference while that same alias is being evaluated (e.g. a
+            // member of a protocol that refers to the protocol itself). An alias whose value is
+            // synthesized by `NewProtocol`/`NewTypedDict` is kept as a lazy reference, too, like
+            // the members of a protocol class: evaluating it eagerly would evaluate every level of
+            // a recursive structure (such as a protocol mirroring a long chain of classes) nested
+            // inside the evaluation of the outermost one.
+            TypeMapping::ApplySpecialization(_)
+                if self.specialization(db).is_some() && alias_has_type_operator(db, self) =>
+            {
+                let mapped = self.map_stored_specialization(db, type_mapping, visitor);
+                if mapped == self {
+                    ty
+                } else if needs_deferral(db, visitor.env, Type::TypeAlias(mapped))
+                    || ActiveOperatorAliasGuard::is_active(mapped)
+                    || alias_value_is_synthesized(db, mapped)
+                {
+                    Type::TypeAlias(mapped)
+                } else {
+                    mapped.value_type_with_recursion(db, visitor.recursion_context)
+                }
+            }
             _ => {
                 // IMPORTANT: All processing must happen inside a single visitor.visit() call so that if we encounter
                 // this same TypeAlias again (e.g., in `type RecursiveT = int | tuple[RecursiveT, ...]`), the visitor
@@ -989,34 +1021,57 @@ const MAX_ACTIVE_OPERATOR_ALIASES: usize = 512;
 #[cfg(target_arch = "wasm32")]
 const MAX_ACTIVE_OPERATOR_ALIASES: usize = 64;
 
-std::thread_local! {
-    /// The number of evaluations of specialized type aliases with type operators that are
-    /// currently active on this thread. Salsa executes nested queries on the calling thread, so
-    /// this counts the nesting of the current query stack.
-    static ACTIVE_OPERATOR_ALIASES: Cell<usize> = const { Cell::new(0) };
+/// Identifies a (specialized) type alias in [`ACTIVE_OPERATOR_ALIASES`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ActiveOperatorAlias {
+    PEP695(salsa::Id),
+    ManualPEP695(salsa::Id),
 }
 
-/// Counts one active evaluation of a specialized alias with type operators while alive.
+impl ActiveOperatorAlias {
+    fn of(alias: TypeAliasType<'_>) -> Self {
+        match alias {
+            TypeAliasType::PEP695(alias) => Self::PEP695(alias.as_id()),
+            TypeAliasType::ManualPEP695(alias) => Self::ManualPEP695(alias.as_id()),
+        }
+    }
+}
+
+std::thread_local! {
+    /// The evaluations of specialized type aliases with type operators that are currently
+    /// active on this thread, innermost last. Salsa executes nested queries on the calling
+    /// thread, so this is the nesting of the current query stack.
+    static ACTIVE_OPERATOR_ALIASES: RefCell<Vec<ActiveOperatorAlias>> = const {
+        RefCell::new(Vec::new())
+    };
+}
+
+/// Records one active evaluation of a specialized alias with type operators while alive.
 struct ActiveOperatorAliasGuard;
 
 impl ActiveOperatorAliasGuard {
-    /// Enters an evaluation, or returns `None` if [`MAX_ACTIVE_OPERATOR_ALIASES`] evaluations are
-    /// already active.
-    fn enter() -> Option<Self> {
-        ACTIVE_OPERATOR_ALIASES.with(|active| {
-            let count = active.get();
-            if count >= MAX_ACTIVE_OPERATOR_ALIASES {
+    /// Enters the evaluation of `alias`, or returns `None` if [`MAX_ACTIVE_OPERATOR_ALIASES`]
+    /// evaluations are already active.
+    fn enter(alias: TypeAliasType<'_>) -> Option<Self> {
+        ACTIVE_OPERATOR_ALIASES.with_borrow_mut(|active| {
+            if active.len() >= MAX_ACTIVE_OPERATOR_ALIASES {
                 return None;
             }
-            active.set(count + 1);
+            active.push(ActiveOperatorAlias::of(alias));
             Some(Self)
         })
+    }
+
+    /// Returns `true` if the value of `alias` is being evaluated on this thread.
+    fn is_active(alias: TypeAliasType<'_>) -> bool {
+        let alias = ActiveOperatorAlias::of(alias);
+        ACTIVE_OPERATOR_ALIASES.with_borrow(|active| active.contains(&alias))
     }
 }
 
 impl Drop for ActiveOperatorAliasGuard {
     fn drop(&mut self) {
-        ACTIVE_OPERATOR_ALIASES.with(|active| active.set(active.get() - 1));
+        ACTIVE_OPERATOR_ALIASES.with_borrow_mut(Vec::pop);
     }
 }
 
@@ -1044,6 +1099,18 @@ pub(crate) fn alias_has_type_operator<'db>(db: &'db dyn Db, alias: TypeAliasType
     }
 
     alias_has_type_operator_inner(db, alias.unspecialized(db), ())
+}
+
+/// Returns `true` if the (unspecialized) value of `alias` is a structure synthesized by
+/// `NewProtocol` or `NewTypedDict`.
+fn alias_value_is_synthesized<'db>(db: &'db dyn Db, alias: TypeAliasType<'db>) -> bool {
+    matches!(
+        alias.unspecialized(db).raw_value_type(db),
+        Type::TypeOperator(operator) if matches!(
+            operator.kind(db),
+            TypeOperatorKind::NewProtocol(_) | TypeOperatorKind::NewTypedDict(_)
+        )
+    )
 }
 
 /// Returns `true` if the type tree of the arguments of `specialization` is nested deeper than

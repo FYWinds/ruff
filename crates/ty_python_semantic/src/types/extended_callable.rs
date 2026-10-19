@@ -286,9 +286,11 @@ pub(crate) fn parameters_from_params<'db>(
         } else {
             kind_name
         };
+        // The default is a value: an alias of it (e.g. `type Zero = Literal[0]`) stands for that
+        // value, which is what the signature displays.
         let default = match default.resolve_type_alias(db) {
             Type::Never => None,
-            _ => Some(default),
+            resolved => Some(resolved),
         };
         parsed.push(ParsedParam {
             name,

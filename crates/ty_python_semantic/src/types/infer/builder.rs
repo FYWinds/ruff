@@ -189,6 +189,7 @@ mod type_operator;
 mod typed_dict;
 mod typeguard;
 mod typevar;
+mod update_class;
 
 use super::comparisons;
 

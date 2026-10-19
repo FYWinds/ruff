@@ -749,22 +749,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             SpecialFormType::GetAnnotations | SpecialFormType::DropAnnotations => {
                 self.infer_annotation_operator_type_expression(subscript, special_form)
             }
-            SpecialFormType::UpdateClass => {
-                // `UpdateClass` (phase 5b) is not evaluated yet; its arguments are still inferred.
-                let arguments_slice = &*subscript.slice;
-                let arguments = if let ast::Expr::Tuple(tuple) = arguments_slice {
-                    &*tuple.elts
-                } else {
-                    std::slice::from_ref(arguments_slice)
-                };
-                self.infer_variadic_type_arguments(arguments);
-                if let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, subscript) {
-                    diagnostic::add_type_expression_reference_link(
-                        builder.into_diagnostic("`UpdateClass` is not supported yet"),
-                    );
-                }
-                Type::unknown()
-            }
+            SpecialFormType::UpdateClass => self.infer_update_class_special_form(subscript),
             _ => unreachable!("not a PEP 827 type-operator special form: {special_form:?}"),
         }
     }

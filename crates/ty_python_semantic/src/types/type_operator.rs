@@ -11,7 +11,8 @@
 //! Phase 4: string operators (`Uppercase`, `Lowercase`, `Capitalize`, `Uncapitalize`, `Concat`,
 //! and `Slice` over strings); see [`super::string_ops`].
 //!
-//! Phase 5: `Annotated` metadata of class attributes (`GetAnnotations`, `DropAnnotations`).
+//! Phase 5: `Annotated` metadata of class attributes (`GetAnnotations`, `DropAnnotations`), and
+//! class updates (`UpdateClass`, see [`update_class`]).
 //!
 //! Operators are evaluated eagerly whenever their operands are fully known. Only two kinds of
 //! operators exist as [`Type::TypeOperator`]:
@@ -20,9 +21,10 @@
 //!   unresolved operators); they are re-evaluated whenever a type mapping (e.g. a
 //!   specialization) is applied to them;
 //! - inert operators ([`TypeOperatorKind::is_inert`]), which are fully evaluated values that only
-//!   exist in this form because they carry information that ordinary types cannot express
-//!   (`Annotated` metadata in the type argument of a `Member`). Code that treats an operator as
-//!   "not known yet" must check [`TypeOperatorKind::is_inert`] first.
+//!   exist in this form because they carry information that ordinary types cannot express:
+//!   `Annotated` metadata in the type argument of a `Member`, the value of `UpdateClass[...]`,
+//!   and the internal views (`ClassView`, `ViewTypeVar`) of a class that is being updated. Code
+//!   that treats an operator as "not known yet" must check [`TypeOperatorKind::is_inert`] first.
 //!
 //! [PEP 827]: https://peps.python.org/pep-0827/
 
@@ -31,6 +33,7 @@ use std::cell::{Cell, RefCell};
 use ruff_python_ast::name::Name;
 
 use super::callable::walk_callable_type;
+use super::class::update_class;
 use super::function::{FunctionType, walk_function_type};
 use super::generic_callable;
 use super::generics::walk_specialization_types;
@@ -51,9 +54,10 @@ use super::typed_dict::{TypedDictFieldBuilder, TypedDictSchema};
 use super::variance::{VarianceInferable, VarianceTerm};
 use super::visitor::{TypeCollector, TypeVisitor};
 use super::{
-    ApplyTypeMappingVisitor, BoundTypeVarIdentity, BoundTypeVarInstance, CallableType, DynamicType,
-    IntersectionType, KnownClass, LiteralValueType, PromotionMode, Type, TypeAliasType,
-    TypeContext, TypeMapping, TypeVarVariance, TypedDictType, UnionBuilder, UnionType, visitor,
+    ApplyTypeMappingVisitor, BoundTypeVarIdentity, BoundTypeVarInstance, CallableType, ClassType,
+    DynamicType, IntersectionType, KnownClass, LiteralValueType, PromotionMode, Type,
+    TypeAliasType, TypeContext, TypeMapping, TypeVarVariance, TypedDictType, UnionBuilder,
+    UnionType, visitor,
 };
 use crate::Db;
 use crate::ProgramEnvironment;
@@ -300,6 +304,23 @@ pub enum TypeOperatorKind<'db> {
         binders: Box<[BoundTypeVarInstance<'db>]>,
         body: Type<'db>,
     },
+    /// Inert (see [`TypeOperatorKind::is_inert`]): `UpdateClass[*Ms]`, the return type of a
+    /// class decorator or of `__init_subclass__` that updates a class (P5-28). Once the members
+    /// are known, every argument is a [`VariadicArg::Single`] `Member` with a string literal name
+    /// (see [`update_class::evaluate_update_class`]). Bounded by `object`: a function returning
+    /// it may return anything.
+    UpdateClass(Box<[VariadicArg<'db>]>),
+    /// Inert and internal: the class `class` as it was before its update number `step` (see
+    /// [`update_class`]). `Attrs` / `Members` of it only see the earlier updates of `class`,
+    /// so that an update can inspect the class it updates without depending on itself. It is
+    /// replaced by the instance type of `class` once the update is evaluated, and is otherwise
+    /// bounded, displayed and introspected as that instance type.
+    ClassView { class: ClassType<'db>, step: u32 },
+    /// Inert and internal: a type parameter of a generic class that is being updated, as seen by
+    /// the update (see [`update_class`]): a fixed type, so that the update can be evaluated for
+    /// the class with its own type parameters. It is replaced by the type variable once the
+    /// update is evaluated, and is otherwise bounded and displayed as the type variable.
+    ViewTypeVar(BoundTypeVarInstance<'db>),
 }
 
 /// How an operand contributes to the result of an operator.
@@ -402,6 +423,8 @@ impl<'db> TypeOperatorKind<'db> {
                 metadata.iter().for_each(|ty| f(*ty, Input));
             }
             Self::GenericCallable { body, .. } => f(*body, Output),
+            Self::UpdateClass(args) => args.iter().for_each(|arg| f(arg.ty(), Input)),
+            Self::ClassView { .. } | Self::ViewTypeVar(_) => {}
         }
     }
 
@@ -535,6 +558,12 @@ impl<'db> TypeOperatorKind<'db> {
                 binders: binders.clone(),
                 body: f(*body, Output)?,
             },
+            Self::UpdateClass(args) => Self::UpdateClass(Self::map_args(args, |ty| f(ty, Input))?),
+            Self::ClassView { class, step } => Self::ClassView {
+                class: *class,
+                step: *step,
+            },
+            Self::ViewTypeVar(typevar) => Self::ViewTypeVar(*typevar),
         })
     }
 
@@ -543,7 +572,13 @@ impl<'db> TypeOperatorKind<'db> {
     /// express. Such an operator never needs deferral, is not a type boolean and cannot be
     /// unpacked; its operands are visited transparently.
     pub(crate) const fn is_inert(&self) -> bool {
-        matches!(self, Self::Annotated { .. })
+        matches!(
+            self,
+            Self::Annotated { .. }
+                | Self::UpdateClass(_)
+                | Self::ClassView { .. }
+                | Self::ViewTypeVar(_)
+        )
     }
 
     fn map_args(
@@ -1594,7 +1629,12 @@ impl<'db> TypeOperatorType<'db> {
                 }
             }
             // Inert: kept as it is (with its operands mapped).
-            TypeOperatorKind::Annotated { .. } => defer(kind),
+            TypeOperatorKind::Annotated { .. }
+            | TypeOperatorKind::ClassView { .. }
+            | TypeOperatorKind::ViewTypeVar(_) => defer(kind),
+            TypeOperatorKind::UpdateClass(args) => {
+                update_class::evaluate_update_class(db, env, &kind, args)
+            }
             TypeOperatorKind::GenericCallable { binders, body } => Ok(
                 generic_callable::evaluate_generic_callable(db, env, binders, *body)?
                     .unwrap_or_else(|| Type::TypeOperator(TypeOperatorType::new(db, kind.clone()))),
@@ -2133,6 +2173,11 @@ impl<'db> TypeOperatorType<'db> {
             // Once evaluated, `RaiseError` is a dynamic type.
             TypeOperatorKind::RaiseError { .. } => Type::unknown(),
             TypeOperatorKind::Annotated { inner, .. } => *inner,
+            TypeOperatorKind::ClassView { class, .. } => Type::instance(db, env, *class),
+            TypeOperatorKind::ViewTypeVar(typevar) => typevar
+                .typevar(db)
+                .upper_bound(db, env)
+                .unwrap_or_else(Type::object),
             TypeOperatorKind::MemberAccess(..)
             | TypeOperatorKind::GetMemberType(..)
             | TypeOperatorKind::UnionOf(_)
@@ -2140,7 +2185,8 @@ impl<'db> TypeOperatorType<'db> {
             | TypeOperatorKind::NewTypedDict(_)
             | TypeOperatorKind::GetArg(..)
             | TypeOperatorKind::GetAnnotations(_)
-            | TypeOperatorKind::DropAnnotations(_) => Type::object(),
+            | TypeOperatorKind::DropAnnotations(_)
+            | TypeOperatorKind::UpdateClass(_) => Type::object(),
         }
     }
 
@@ -2155,6 +2201,9 @@ impl<'db> TypeOperatorType<'db> {
             // Once evaluated, `RaiseError` is a dynamic type.
             TypeOperatorKind::RaiseError { .. } => Type::unknown(),
             TypeOperatorKind::Annotated { inner, .. } => *inner,
+            TypeOperatorKind::ClassView { class, .. } => Type::instance(db, env, *class),
+            // Any value may be returned from a function whose return type is `UpdateClass`.
+            TypeOperatorKind::UpdateClass(_) => Type::object(),
             _ => Type::Never,
         }
     }
@@ -2176,6 +2225,15 @@ impl<'db> TypeOperatorType<'db> {
         tcx: TypeContext<'db>,
         visitor: &ApplyTypeMappingVisitor<'_, 'db>,
     ) -> Type<'db> {
+        if let TypeMapping::ResolveClassViews = type_mapping {
+            match self.kind(db) {
+                TypeOperatorKind::ClassView { class, .. } => {
+                    return Type::instance(db, visitor.env, *class);
+                }
+                TypeOperatorKind::ViewTypeVar(typevar) => return Type::TypeVar(*typevar),
+                _ => {}
+            }
+        }
         visitor.visit(db, Type::TypeOperator(self), type_mapping, || {
             let env = visitor.env;
             let maps_inputs = !matches!(
@@ -2286,12 +2344,14 @@ impl<'db> TypeOperatorType<'db> {
                 | TypeOperatorKind::NewProtocol(before)
                 | TypeOperatorKind::NewTypedDict(before)
                 | TypeOperatorKind::OverloadedOf(before)
+                | TypeOperatorKind::UpdateClass(before)
                 | TypeOperatorKind::ExtendedCallable { params: before, .. },
                 TypeOperatorKind::TupleOf(after)
                 | TypeOperatorKind::UnionOf(after)
                 | TypeOperatorKind::NewProtocol(after)
                 | TypeOperatorKind::NewTypedDict(after)
                 | TypeOperatorKind::OverloadedOf(after)
+                | TypeOperatorKind::UpdateClass(after)
                 | TypeOperatorKind::ExtendedCallable { params: after, .. },
             ) = (self.kind(db), &kind)
                 && before.iter().zip(after.iter()).any(|(before, after)| {

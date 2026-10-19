@@ -19,6 +19,7 @@ use crate::{
         call::Argument,
         class::{
             CodeGeneratorKind, Field, FieldKind, MetaclassErrorKind, expanded_class_base_entries,
+            update_class,
         },
         context::InferContext,
         definition_expression_type,
@@ -849,6 +850,9 @@ pub(crate) fn check_static_class_definitions<'db>(
             }
         }
     }
+
+    // PEP 827: cycles between class updates, and `RaiseError`s selected by them.
+    update_class::report_class_update_errors(context, class, class_node);
 
     // If the class is generic, verify that its generic context does not violate any of
     // the typevar scoping rules.

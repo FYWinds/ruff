@@ -1200,7 +1200,10 @@ fn type_operator_precedence<'db>(db: &'db dyn Db, ty: Type<'db>) -> u8 {
             | TypeOperatorKind::DropAnnotations(_)
             | TypeOperatorKind::GenericCallable { .. }
             | TypeOperatorKind::ExtendedCallable { .. }
-            | TypeOperatorKind::OverloadedOf(_) => 4,
+            | TypeOperatorKind::OverloadedOf(_)
+            | TypeOperatorKind::UpdateClass(_)
+            | TypeOperatorKind::ClassView { .. }
+            | TypeOperatorKind::ViewTypeVar(_) => 4,
             // Displayed as its inner type.
             TypeOperatorKind::Annotated { inner, .. } => type_operator_precedence(db, *inner),
         },
@@ -1505,6 +1508,20 @@ fn fmt_type_operator<'db>(
         ),
         // An inert `Annotated` type is displayed as its inner type: the metadata is invisible.
         TypeOperatorKind::Annotated { inner, .. } => inner
+            .display_with(db, env, settings.clone())
+            .fmt_detailed(f),
+        TypeOperatorKind::UpdateClass(args) => variadic(
+            f,
+            SpecialFormType::UpdateClass.name(),
+            Some(SpecialFormType::UpdateClass),
+            args,
+        ),
+        // The internal views of a class that is being updated are displayed as the class and its
+        // type parameters.
+        TypeOperatorKind::ClassView { class, .. } => Type::instance(db, env, *class)
+            .display_with(db, env, settings.clone())
+            .fmt_detailed(f),
+        TypeOperatorKind::ViewTypeVar(typevar) => Type::TypeVar(*typevar)
             .display_with(db, env, settings.clone())
             .fmt_detailed(f),
         TypeOperatorKind::GenericCallable { binders, body } => {

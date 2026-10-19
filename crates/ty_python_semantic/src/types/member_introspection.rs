@@ -10,6 +10,10 @@
 //! starting from the most basic class. A subclass that redeclares a member keeps the member's
 //! original position but supplies its type, initializer and definer.
 //!
+//! The own members of a class that is updated with PEP 827 `UpdateClass` include its updates
+//! (see [`update_class`]); `Attrs` / `Members` of the internal `ClassView` of a class only
+//! include the updates of the class that come before the one being evaluated.
+//!
 //! [PEP 827]: https://peps.python.org/pep-0827/
 
 use ruff_db::parsed::parsed_module;
@@ -18,7 +22,7 @@ use ty_module_resolver::{KnownModule, file_to_module};
 use ty_python_core::definition::{Definition, DefinitionKind, DefinitionState};
 use ty_python_core::{place_table, use_def_map};
 
-use super::class::CodeGeneratorKind;
+use super::class::{CodeGeneratorKind, update_class};
 use super::member::class_member;
 use crate::place::place_from_bindings;
 use crate::reachability::DeclarationsIteratorExtension;
@@ -176,12 +180,24 @@ pub(crate) fn members_of<'db>(
 ) -> Option<Type<'db>> {
     match ty.resolve_type_alias(db) {
         Type::NominalInstance(instance) => {
-            Some(class_members(db, instance.class(db, env), attrs_only))
+            Some(class_members(db, instance.class(db, env), attrs_only, None))
         }
+        // The class as it was before one of its updates (see `update_class`).
+        Type::TypeOperator(operator) => match operator.kind(db) {
+            TypeOperatorKind::ClassView { class, step } => Some(class_members(
+                db,
+                update_class::view_class(db, *class),
+                attrs_only,
+                Some(*step),
+            )),
+            _ => None,
+        },
         Type::ProtocolInstance(protocol) => protocol
             .class_origin(db)
-            .map(|class| class_members(db, *class, attrs_only)),
-        Type::TypedDict(TypedDictType::Class(class)) => Some(class_members(db, class, attrs_only)),
+            .map(|class| class_members(db, *class, attrs_only, None)),
+        Type::TypedDict(TypedDictType::Class(class)) => {
+            Some(class_members(db, class, attrs_only, None))
+        }
         Type::TypedDict(typed_dict @ TypedDictType::Synthesized(_)) => {
             Some(Type::heterogeneous_tuple(
                 db,
@@ -244,14 +260,20 @@ pub(crate) fn find_member<'db>(
     })
 }
 
-/// Cached member collection for a class, keyed by the class and whether to only include
-/// attributes.
+/// Cached member collection for a class, keyed by the class, whether to only include
+/// attributes, and how many updates of the class itself (`UpdateClass`) to apply (`None` for
+/// all of them).
 #[salsa::tracked(
     returns(copy),
-    cycle_initial=|_, _, _, _| Type::Never,
+    cycle_initial=|_, _, _, _, _| Type::Never,
     heap_size=ruff_memory_usage::heap_size,
 )]
-fn class_members<'db>(db: &'db dyn Db, class: ClassType<'db>, attrs_only: bool) -> Type<'db> {
+fn class_members<'db>(
+    db: &'db dyn Db,
+    class: ClassType<'db>,
+    attrs_only: bool,
+    steps: Option<u32>,
+) -> Type<'db> {
     let env = ProgramEnvironment::from_file(class.class_literal(db).program_file(db));
 
     if class.is_typed_dict(db) {
@@ -262,6 +284,7 @@ fn class_members<'db>(db: &'db dyn Db, class: ClassType<'db>, attrs_only: bool) 
     let mut methods: FxIndexMap<Name, CollectedMember<'db>> = FxIndexMap::default();
 
     let mro: Vec<ClassBase<'db>> = class.iter_mro(db).collect();
+    let level_count = mro.len();
     for (level, base) in mro.into_iter().rev().enumerate() {
         let Some(base_class) = base.into_class() else {
             continue;
@@ -273,7 +296,18 @@ fn class_members<'db>(db: &'db dyn Db, class: ClassType<'db>, attrs_only: bool) 
             continue;
         }
         let definer = Type::instance(db, &env, base_class);
-        for own in own_members(db, class_literal) {
+        // Only the class itself is viewed before some of its updates.
+        let steps = if level + 1 == level_count {
+            steps
+        } else {
+            None
+        };
+        let (own_members, removed) = updated_own_members(db, class_literal, steps);
+        for name in &removed {
+            attributes.shift_remove(name);
+            methods.shift_remove(name);
+        }
+        for own in own_members {
             let member = CollectedMember {
                 // A method's retained synthetic `Self` is bounded by the owner, so the owner's
                 // specialization also applies to that bound (P5-7).
@@ -393,6 +427,52 @@ struct OwnMember<'db> {
     qualifiers: TypeQualifiers,
     init: Type<'db>,
     is_method: bool,
+}
+
+/// The members of `class` itself after its first `steps` updates (all of them if `None`), and
+/// the names that its updates remove (also from the members inherited from its bases).
+///
+/// The members of each update come first, in the order of the update, followed by the members
+/// that it does not replace (P5-27).
+fn updated_own_members<'db>(
+    db: &'db dyn Db,
+    class: StaticClassLiteral<'db>,
+    steps: Option<u32>,
+) -> (Vec<OwnMember<'db>>, Vec<Name>) {
+    let mut members = own_members(db, class);
+    let mut removed: Vec<Name> = Vec::new();
+    if !update_class::has_class_updates(db, class) {
+        return (members, removed);
+    }
+    let count = update_class::class_update_count(db, class);
+    for step in 0..steps.map_or(count, |steps| steps.min(count)) {
+        let update = &update_class::class_update_step(db, class, step).members;
+        if update.is_empty() {
+            continue;
+        }
+        let mut updated = Vec::with_capacity(update.len() + members.len());
+        for member in update {
+            removed.retain(|name| *name != member.name);
+            if member.is_removal() {
+                removed.push(member.name.clone());
+                continue;
+            }
+            updated.push(OwnMember {
+                name: member.name.clone(),
+                ty: member.ty,
+                qualifiers: member.qualifiers,
+                init: member.init,
+                is_method: member.is_method(),
+            });
+        }
+        updated.extend(
+            members
+                .into_iter()
+                .filter(|own| !update.iter().any(|member| member.name == own.name)),
+        );
+        members = updated;
+    }
+    (members, removed)
 }
 
 /// Classes from `builtins` (including `object`) and type-checker internal fallback classes

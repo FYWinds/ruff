@@ -12,6 +12,7 @@ use ruff_text_size::{Ranged, TextRange};
 use std::cell::RefCell;
 
 use super::implicit_attributes::implicit_attribute_names;
+use super::update_class::{self, UpdateClassDecorator};
 use crate::{
     Db, FxIndexMap, FxIndexSet, TypeQualifiers,
     place::{
@@ -98,9 +99,9 @@ pub struct StaticClassLiteral<'db> {
     #[returns(copy)]
     pub(crate) total_ordering: bool,
 
-    /// Whether this class has any decorators.
-    #[returns(copy)]
-    pub(crate) has_decorators: bool,
+    /// What this class's literal records about its decorators.
+    #[returns(ref)]
+    pub(crate) decorator_info: ClassDecoratorInfo<'db>,
 
     /// Whether this class has PEP 695 type parameters.
     #[returns(copy)]
@@ -113,6 +114,28 @@ pub struct StaticClassLiteral<'db> {
     /// Whether this class has an explicit `metaclass` keyword argument.
     #[returns(copy)]
     pub(crate) has_explicit_metaclass: bool,
+}
+
+/// What a [`StaticClassLiteral`] records about the decorators of its class.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, get_size2::GetSize, salsa::SalsaValue)]
+pub struct ClassDecoratorInfo<'db> {
+    /// Whether the class has any decorators.
+    has_decorators: bool,
+    /// The class decorators whose return type is PEP 827 `UpdateClass[...]`, from the innermost
+    /// one (see [`super::update_class`]).
+    update_class_decorators: Box<[UpdateClassDecorator<'db>]>,
+}
+
+impl<'db> ClassDecoratorInfo<'db> {
+    pub(crate) fn new(
+        has_decorators: bool,
+        update_class_decorators: Box<[UpdateClassDecorator<'db>]>,
+    ) -> Self {
+        Self {
+            has_decorators,
+            update_class_decorators,
+        }
+    }
 }
 
 // The Salsa heap is tracked separately.
@@ -270,11 +293,25 @@ impl<'db> StaticClassLiteral<'db> {
             dataclass_params,
             self.dataclass_transformer_params(db),
             self.total_ordering(db),
-            self.has_decorators(db),
+            self.decorator_info(db).clone(),
             self.has_type_params(db),
             self.has_explicit_bases(db),
             self.has_explicit_metaclass(db),
         )
+    }
+
+    /// Whether this class has any decorators.
+    pub(crate) fn has_decorators(self, db: &'db dyn Db) -> bool {
+        self.decorator_info(db).has_decorators
+    }
+
+    /// The class decorators whose return type is PEP 827 `UpdateClass[...]`, from the innermost
+    /// one.
+    pub(crate) fn update_class_decorators(
+        self,
+        db: &'db dyn Db,
+    ) -> &'db [UpdateClassDecorator<'db>] {
+        &self.decorator_info(db).update_class_decorators
     }
 
     /// Returns `true` if this class defines any ordering method (`__lt__`, `__le__`, `__gt__`,
@@ -1522,6 +1559,11 @@ impl<'db> StaticClassLiteral<'db> {
                 }),
                 _ => ty,
             }
+        }
+
+        // PEP 827 class updates (`UpdateClass`) override everything else in the class.
+        if let Some(member) = update_class::own_updated_class_member(db, self, name) {
+            return member;
         }
 
         // Check if this class is dataclass-like (either via @dataclass or via dataclass_transform)
@@ -2923,6 +2965,11 @@ impl<'db> StaticClassLiteral<'db> {
         // TODO: There are many things that are not yet implemented here:
         // - `typing.Final`
         // - Proper diagnostics
+
+        // PEP 827 class updates (`UpdateClass`) override everything else in the class.
+        if let Some(member) = update_class::own_updated_instance_member(db, self, name) {
+            return member;
+        }
 
         // NamedTuple fields are modeled via synthesized descriptors on the class. Treating them
         // as instance attributes here causes inherited fields to leak through after a subclass

@@ -13,7 +13,7 @@ pub(super) use self::named_tuple::{
 };
 pub use self::slots::SlotDescriptorType;
 pub(crate) use self::static_literal::{
-    ExpandedClassBaseEntry, FrozenDataclassDispatch, StaticClassLiteral,
+    ClassDecoratorInfo, ExpandedClassBaseEntry, FrozenDataclassDispatch, StaticClassLiteral,
     expanded_class_base_entries,
 };
 pub(super) use self::typed_dict::{
@@ -78,6 +78,7 @@ mod named_tuple;
 mod slots;
 mod static_literal;
 mod typed_dict;
+pub(super) mod update_class;
 
 #[derive(Clone, Copy)]
 enum DynamicClassHeaderAnchor<'db> {

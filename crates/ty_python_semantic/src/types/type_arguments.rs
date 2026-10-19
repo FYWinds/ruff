@@ -12,7 +12,7 @@ use super::member_introspection::string_literal_type;
 use super::special_form::SpecialFormType;
 use super::string_ops::StringOperand;
 use super::tuple::{TupleSpec, TupleSpecBuilder, TupleType};
-use super::type_operator::strip_annotated;
+use super::type_operator::{TypeOperatorKind, strip_annotated};
 use super::{ClassLiteral, KnownClass, LiteralValueType, Type};
 use crate::Db;
 use crate::ProgramEnvironment;
@@ -108,7 +108,8 @@ fn type_arguments_as<'db>(
     Some(builder.build())
 }
 
-/// The class of an instance type, including `TypedDict`s.
+/// The class of an instance type, including `TypedDict`s and the view of a class that is being
+/// updated (`ClassView`, see `update_class`).
 fn instance_class<'db>(
     db: &'db dyn Db,
     env: &ProgramEnvironment<'db>,
@@ -116,6 +117,12 @@ fn instance_class<'db>(
 ) -> Option<ClassType<'db>> {
     match ty {
         Type::TypedDict(typed_dict) => typed_dict.defining_class(),
+        Type::TypeOperator(operator) => match operator.kind(db) {
+            TypeOperatorKind::ClassView { class, .. } => {
+                Some(super::class::update_class::view_class(db, *class))
+            }
+            _ => None,
+        },
         _ => ty.nominal_class(db, env),
     }
 }

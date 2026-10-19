@@ -3,6 +3,10 @@ use crate::ProgramEnvironment;
 use crate::types::{
     CallArguments, DataclassParams, KnownClass, KnownInstanceType, SpecialFormType,
     StaticClassLiteral, SubclassOfType, Type, TypeContext, TypingModule, UnionType,
+    class::{
+        ClassDecoratorInfo,
+        update_class::{UpdateClassDecorator, update_class_decorator},
+    },
     function::{KnownFunction, OverloadLiteral},
     infer::{
         TypeInferenceBuilder,
@@ -148,6 +152,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         let mut dataclass_params = None;
         let mut dataclass_transformer_params = None;
         let mut total_ordering = false;
+        let mut update_class_decorators = Vec::new();
         let has_explicit_bases = class_node
             .arguments
             .as_deref()
@@ -156,42 +161,49 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             .arguments
             .as_deref()
             .is_some_and(|arguments| arguments.find_keyword("metaclass").is_some());
-        let infer_original_class_ty = |deprecated,
-                                       type_check_only,
-                                       dataclass_params,
-                                       dataclass_transformer_params,
-                                       total_ordering| {
-            match (maybe_known_class, &*name.id) {
-                (None, "NamedTuple") if in_typing_module() => {
-                    Type::SpecialForm(SpecialFormType::NamedTuple)
+        let infer_original_class_ty =
+            |deprecated,
+             type_check_only,
+             dataclass_params,
+             dataclass_transformer_params,
+             total_ordering,
+             update_class_decorators: &[UpdateClassDecorator<'db>]| {
+                match (maybe_known_class, &*name.id) {
+                    (None, "NamedTuple") if in_typing_module() => {
+                        Type::SpecialForm(SpecialFormType::NamedTuple)
+                    }
+                    (None, "Any") if in_typing_module() => Type::SpecialForm(SpecialFormType::Any),
+                    (None, "InitVar") if known_module() == Some(KnownModule::Dataclasses) => {
+                        Type::SpecialForm(SpecialFormType::TypeQualifier(TypeQualifier::InitVar))
+                    }
+                    _ => Type::from(StaticClassLiteral::new(
+                        db,
+                        &name.id,
+                        body_scope,
+                        maybe_known_class,
+                        deprecated,
+                        type_check_only,
+                        dataclass_params,
+                        dataclass_transformer_params,
+                        total_ordering,
+                        ClassDecoratorInfo::new(
+                            !class_node.decorator_list.is_empty(),
+                            update_class_decorators.into(),
+                        ),
+                        class_node.type_params.is_some(),
+                        has_explicit_bases,
+                        has_explicit_metaclass,
+                    )),
                 }
-                (None, "Any") if in_typing_module() => Type::SpecialForm(SpecialFormType::Any),
-                (None, "InitVar") if known_module() == Some(KnownModule::Dataclasses) => {
-                    Type::SpecialForm(SpecialFormType::TypeQualifier(TypeQualifier::InitVar))
-                }
-                _ => Type::from(StaticClassLiteral::new(
-                    db,
-                    &name.id,
-                    body_scope,
-                    maybe_known_class,
-                    deprecated,
-                    type_check_only,
-                    dataclass_params,
-                    dataclass_transformer_params,
-                    total_ordering,
-                    !class_node.decorator_list.is_empty(),
-                    class_node.type_params.is_some(),
-                    has_explicit_bases,
-                    has_explicit_metaclass,
-                )),
-            }
-        };
+            };
         // In the first pass, collect metadata decorators that shape the original class object.
         // Once an inner decorator replaces the public binding, outer decorators are ordinary
         // runtime applications only: they cannot retroactively add metadata to the original class.
         // For ordinary decorators that still apply to the original class, precompute the call so
         // the second pass can reuse it if no inner decorator has changed the binding.
-        for &(decorator_ty, decorator) in decorator_types_and_nodes.iter().rev() {
+        for (index, &(decorator_ty, decorator)) in
+            decorator_types_and_nodes.iter().enumerate().rev()
+        {
             if !metadata_applies_to_original_class {
                 decorators_to_apply.push((
                     decorator_ty,
@@ -261,6 +273,17 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 continue;
             }
 
+            // PEP 827: a decorator returning `UpdateClass[...]` keeps the class binding and
+            // updates the class (see `update_class`). It is not called here: its return type
+            // depends on the members of the class that is being defined.
+            if let Some(function) = update_class_decorator(db, decorator_ty) {
+                update_class_decorators.push(UpdateClassDecorator {
+                    index: u32::try_from(index).unwrap_or(u32::MAX),
+                    function,
+                });
+                continue;
+            }
+
             if let Type::FunctionLiteral(f) = decorator_ty {
                 // We do not yet detect or flag `@dataclass_transform` applied to more than one
                 // overload, or an overload and the implementation both. Nevertheless, this is not
@@ -308,6 +331,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 dataclass_params,
                 dataclass_transformer_params,
                 total_ordering,
+                &update_class_decorators,
             );
             let decorator_result = apply_class_decorator(db, env, decorator_ty, original_class_ty);
             let decorated_ty = decorator_result.return_type();
@@ -330,6 +354,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             dataclass_params,
             dataclass_transformer_params,
             total_ordering,
+            &update_class_decorators,
         );
 
         let original_class_ty = inferred_ty;

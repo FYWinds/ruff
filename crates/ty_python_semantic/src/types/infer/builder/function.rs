@@ -43,7 +43,10 @@ use crate::{
         infer_definition_types,
         list_members::all_members,
         relation::TypeRelation,
-        signatures::{ReturnCallableTypeVarScope, function_signature_expression_type},
+        signatures::{
+            ReturnCallableTypeVarScope, function_signature_expression_type,
+            unpacked_typed_dict_kwargs_typevar,
+        },
         tuple::{TupleSpec, TupleSpecBuilder, TupleType},
         typed_dict::extract_unpacked_typed_dict_keys_from_kwargs_annotation,
         typevar::TypeVarSet,
@@ -1002,6 +1005,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             annotation_flags,
         ) else {
             if !annotated_type.is_unknown()
+                && unpacked_typed_dict_kwargs_typevar(db, env, annotated_type, annotation_flags)
+                    .is_none()
                 && let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, annotation)
             {
                 let diag = builder.into_diagnostic(format_args!(
@@ -1402,6 +1407,13 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 self.file_type_expression_flags(annotation),
             )
             .is_some()
+                || unpacked_typed_dict_kwargs_typevar(
+                    db,
+                    env,
+                    annotated_type,
+                    self.file_type_expression_flags(annotation),
+                )
+                .is_some()
             {
                 annotated_type
             } else {

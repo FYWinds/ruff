@@ -145,6 +145,10 @@ pub enum KnownClass {
     NamedTupleLike,
     // ty_extensions (PEP 827)
     TyExtensionsMember,
+    TyExtensionsParam,
+    TyExtensionsParams,
+    TyExtensionsParamKind,
+    TyExtensionsInitField,
     TypedDictFallback,
     // string.templatelib
     Template,
@@ -278,6 +282,10 @@ impl KnownClass {
             | Self::NamedTupleFallback
             | Self::NamedTupleLike
             | Self::TyExtensionsMember
+            | Self::TyExtensionsParam
+            | Self::TyExtensionsParams
+            | Self::TyExtensionsParamKind
+            | Self::TyExtensionsInitField
             | Self::TypedDictFallback
             | Self::Template
             | Self::Path
@@ -419,6 +427,10 @@ impl KnownClass {
             | Self::NamedTupleFallback
             | Self::NamedTupleLike
             | Self::TyExtensionsMember
+            | Self::TyExtensionsParam
+            | Self::TyExtensionsParams
+            | Self::TyExtensionsParamKind
+            | Self::TyExtensionsInitField
             | Self::ConstraintSet
             | Self::ConstraintSetSolution
             | Self::GenericContext
@@ -545,6 +557,9 @@ impl KnownClass {
             | KnownClass::NamedTupleFallback
             | KnownClass::NamedTupleLike
             | KnownClass::TyExtensionsMember
+            | KnownClass::TyExtensionsParam
+            | KnownClass::TyExtensionsParams
+            | KnownClass::TyExtensionsInitField
             | KnownClass::ConstraintSet
             | KnownClass::ConstraintSetSolution
             | KnownClass::GenericContext
@@ -563,6 +578,7 @@ impl KnownClass {
             | KnownClass::PydanticRootModel
             | KnownClass::PydanticStrict
             | KnownClass::PytestParametrizeMarkDecorator => false,
+            KnownClass::TyExtensionsParamKind => true,
         }
     }
 
@@ -665,6 +681,10 @@ impl KnownClass {
             | KnownClass::NamedTupleFallback
             | KnownClass::NamedTupleLike
             | KnownClass::TyExtensionsMember
+            | KnownClass::TyExtensionsParam
+            | KnownClass::TyExtensionsParams
+            | KnownClass::TyExtensionsParamKind
+            | KnownClass::TyExtensionsInitField
             | KnownClass::ConstraintSet
             | KnownClass::ConstraintSetSolution
             | KnownClass::GenericContext
@@ -786,6 +806,10 @@ impl KnownClass {
             | KnownClass::ExtensionTypedDictFallback
             | KnownClass::NamedTupleLike
             | KnownClass::TyExtensionsMember
+            | KnownClass::TyExtensionsParam
+            | KnownClass::TyExtensionsParams
+            | KnownClass::TyExtensionsParamKind
+            | KnownClass::TyExtensionsInitField
             | KnownClass::NamedTupleFallback
             | KnownClass::ConstraintSet
             | KnownClass::ConstraintSetSolution
@@ -914,6 +938,10 @@ impl KnownClass {
             | Self::KwOnly
             | Self::NamedTupleFallback
             | Self::TyExtensionsMember
+            | Self::TyExtensionsParam
+            | Self::TyExtensionsParams
+            | Self::TyExtensionsParamKind
+            | Self::TyExtensionsInitField
             | Self::ConstraintSet
             | Self::ConstraintSetSolution
             | Self::GenericContext
@@ -1042,6 +1070,10 @@ impl KnownClass {
             | KnownClass::KwOnly
             | KnownClass::NamedTupleLike
             | KnownClass::TyExtensionsMember
+            | KnownClass::TyExtensionsParam
+            | KnownClass::TyExtensionsParams
+            | KnownClass::TyExtensionsParamKind
+            | KnownClass::TyExtensionsInitField
             | KnownClass::Template
             | KnownClass::Path
             | KnownClass::FunctoolsPartial
@@ -1172,6 +1204,10 @@ impl KnownClass {
             Self::NamedTupleFallback => "NamedTupleFallback",
             Self::NamedTupleLike => "NamedTupleLike",
             Self::TyExtensionsMember => "Member",
+            Self::TyExtensionsParam => "Param",
+            Self::TyExtensionsParams => "Params",
+            Self::TyExtensionsParamKind => "ParamKind",
+            Self::TyExtensionsInitField => "InitField",
             Self::ConstraintSet => "ConstraintSet",
             Self::ConstraintSetSolution => "ConstraintSetSolution",
             Self::GenericContext => "GenericContext",
@@ -1607,7 +1643,12 @@ impl KnownClass {
             | Self::OrderedDict => KnownModule::Collections,
             Self::Field | Self::KwOnly => KnownModule::Dataclasses,
             Self::NamedTupleFallback | Self::TypedDictFallback => KnownModule::TypeCheckerInternals,
-            Self::NamedTupleLike | Self::TyExtensionsMember => KnownModule::TyExtensions,
+            Self::NamedTupleLike
+            | Self::TyExtensionsMember
+            | Self::TyExtensionsParam
+            | Self::TyExtensionsParams
+            | Self::TyExtensionsParamKind
+            | Self::TyExtensionsInitField => KnownModule::TyExtensions,
             Self::ConstraintSet
             | Self::ConstraintSetSolution
             | Self::GenericContext
@@ -1731,6 +1772,10 @@ impl KnownClass {
             | Self::NamedTupleFallback
             | Self::NamedTupleLike
             | Self::TyExtensionsMember
+            | Self::TyExtensionsParam
+            | Self::TyExtensionsParams
+            | Self::TyExtensionsParamKind
+            | Self::TyExtensionsInitField
             | Self::ConstraintSet
             | Self::ConstraintSetSolution
             | Self::GenericContext
@@ -1852,6 +1897,10 @@ impl KnownClass {
             "NamedTupleFallback" => &[Self::NamedTupleFallback],
             "NamedTupleLike" => &[Self::NamedTupleLike],
             "Member" => &[Self::TyExtensionsMember],
+            "Param" => &[Self::TyExtensionsParam],
+            "Params" => &[Self::TyExtensionsParams],
+            "ParamKind" => &[Self::TyExtensionsParamKind],
+            "InitField" => &[Self::TyExtensionsInitField],
             "ConstraintSet" => &[Self::ConstraintSet],
             "ConstraintSetSolution" => &[Self::ConstraintSetSolution],
             "GenericContext" => &[Self::GenericContext],
@@ -1959,6 +2008,10 @@ impl KnownClass {
             | Self::Sentinel
             | Self::NamedTupleLike
             | Self::TyExtensionsMember
+            | Self::TyExtensionsParam
+            | Self::TyExtensionsParams
+            | Self::TyExtensionsParamKind
+            | Self::TyExtensionsInitField
             | Self::ConstraintSet
             | Self::ConstraintSetSolution
             | Self::GenericContext

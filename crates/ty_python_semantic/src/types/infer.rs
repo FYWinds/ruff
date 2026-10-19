@@ -176,6 +176,11 @@ bitflags::bitflags! {
 
         /// The expression refers to a `TypeVarTuple` without unpacking it.
         const INVALID_BARE_TYPE_VAR_TUPLE = 1 << 2;
+
+        /// The expression is the type argument `T` of `Member[N, T, ...]`, the only position
+        /// where a PEP 827 `GenericCallable[...]` may be written. Set before the expression is
+        /// inferred.
+        const GENERIC_CALLABLE_POSITION = 1 << 3;
     }
 }
 

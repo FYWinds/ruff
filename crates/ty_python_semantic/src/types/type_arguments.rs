@@ -7,10 +7,12 @@
 use ty_module_resolver::file_to_module;
 
 use super::class::ClassType;
+use super::extended_callable;
 use super::member_introspection::string_literal_type;
 use super::special_form::SpecialFormType;
 use super::string_ops::StringOperand;
 use super::tuple::{TupleSpec, TupleSpecBuilder, TupleType};
+use super::type_operator::strip_annotated;
 use super::{ClassLiteral, KnownClass, LiteralValueType, Type};
 use crate::Db;
 use crate::ProgramEnvironment;
@@ -33,6 +35,8 @@ pub(crate) fn normalize_base<'db>(
     let class = match ty.resolve_type_alias(db) {
         dynamic @ Type::Dynamic(_) => return Some(dynamic),
         Type::Callable(_) => return Some(Type::SpecialForm(SpecialFormType::TypingCallable)),
+        // A bare `Overloaded` is only valid as a `Base` (P5-34).
+        overloaded @ Type::SpecialForm(SpecialFormType::Overloaded) => return Some(overloaded),
         Type::SubclassOf(_) => return Some(KnownClass::Type.to_class_literal(db, env)),
         Type::NominalInstance(instance) => instance.class(db, env),
         Type::ProtocolInstance(instance) => *instance.class_origin(db)?,
@@ -96,7 +100,9 @@ fn type_arguments_as<'db>(
         {
             builder = builder.concat(db, env, &spec);
         } else {
-            builder.push(*argument);
+            // The inert `Annotated` wrapper of a `Member`'s type is only visible to
+            // `GetAnnotations` / `DropAnnotations` (P5-22).
+            builder.push(strip_annotated(db, *argument));
         }
     }
     Some(builder.build())
@@ -136,7 +142,10 @@ pub(super) fn get_arg<'db>(
 
     let base_class = match base {
         Type::SpecialForm(SpecialFormType::TypingCallable) => {
-            return callable_return_type(db, env, ty, operator, index);
+            return extended_callable::callable_arg(db, env, ty, operator, index);
+        }
+        Type::SpecialForm(SpecialFormType::Overloaded) => {
+            return extended_callable::overloaded_arg(db, env, ty, operator, index);
         }
         Type::ClassLiteral(class) => class,
         _ => {
@@ -147,12 +156,31 @@ pub(super) fn get_arg<'db>(
     };
     let base_name = base_class.name(db);
 
-    let arguments = type_arguments_as(db, env, ty, base_class).ok_or_else(|| {
-        format!(
+    // Class methods and static methods are usually function-like callables rather than instances
+    // of the typeshed classes (P5-10).
+    let method_base = base_class
+        .known(db)
+        .filter(|known| matches!(known, KnownClass::Classmethod | KnownClass::Staticmethod));
+    let Some(arguments) = type_arguments_as(db, env, ty, base_class) else {
+        if let Some(method_base) = method_base {
+            return extended_callable::method_arg(db, env, ty, method_base, operator, index);
+        }
+        return Err(format!(
             "`{operator}` requires a subclass of `{base_name}`, but got `{}`",
             ty.display(db, env)
+        ));
+    };
+    // The `ParamSpec` argument of `classmethod[C, P, R]` / `staticmethod[P, R]` is a `Params`.
+    let arguments = if method_base.is_some() {
+        TupleSpec::heterogeneous(
+            arguments
+                .fixed_elements()
+                .map(|argument| extended_callable::paramspec_value_as_params(db, env, *argument))
+                .collect::<Vec<_>>(),
         )
-    })?;
+    } else {
+        arguments
+    };
 
     let Some(index) = index else {
         return Ok(Type::tuple(TupleType::new(db, env, &arguments)));
@@ -166,53 +194,6 @@ pub(super) fn get_arg<'db>(
                 ty.display(db, env)
             )
         })
-}
-
-/// `GetArg[ty, Callable, index]`: only the return type (index `1` or `-1`) of a callable with a
-/// single, non-generic signature is supported for now.
-fn callable_return_type<'db>(
-    db: &'db dyn Db,
-    env: &ProgramEnvironment<'db>,
-    ty: Type<'db>,
-    operator: &str,
-    index: Option<i64>,
-) -> Result<Type<'db>, EvaluationError> {
-    if !matches!(index, Some(1 | -1)) {
-        return Err(format!(
-            "Getting the parameters of a `Callable` with `{operator}` is not supported yet"
-        ));
-    }
-    let callable = ty
-        .try_upcast_to_callable(db, env)
-        .and_then(|callables| callables.exactly_one())
-        .ok_or_else(|| {
-            format!(
-                "`{operator}` requires a callable type, but got `{}`",
-                ty.display(db, env)
-            )
-        })?;
-    let [signature] = &callable.signatures(db).overloads[..] else {
-        return Err(format!(
-            "Getting the return type of an overloaded callable with `{operator}` is not \
-             supported yet"
-        ));
-    };
-    let return_ty = signature.return_ty;
-    if let Some(generic_context) = signature.generic_context {
-        // Methods get a synthetic `Self` type variable; that is fine as long as the return type
-        // does not mention it. Any other type variable would escape its signature.
-        let only_unused_self = generic_context.variables(db).all(|typevar| {
-            typevar.typevar(db).is_self(db)
-                && !return_ty.references_typevar(db, env, typevar.typevar(db).identity(db))
-        });
-        if !only_unused_self {
-            return Err(format!(
-                "Getting the return type of a generic callable with `{operator}` is not \
-                 supported yet"
-            ));
-        }
-    }
-    Ok(return_ty)
 }
 
 /// Evaluates `Length[ty]` for a non-union, non-dynamic argument.

@@ -16,15 +16,20 @@ use ruff_text_size::Ranged;
 use ty_python_core::scope::NodeWithScopeRef;
 
 use super::TypeInferenceBuilder;
+use crate::types::KnownClass;
 use crate::types::diagnostic::{
     self, INVALID_TYPE_FORM, report_invalid_argument_number_to_special_form,
+};
+use crate::types::extended_callable::{
+    ParamsConversion, is_param_instance, parameters_from_params, params_elements,
 };
 use crate::types::function::KnownFunction;
 use crate::types::infer::TypeExpressionFlags;
 use crate::types::member_introspection::member_args;
+use crate::types::signatures::Parameters;
 use crate::types::type_operator::{
-    MemberField, Sequence, TypeOperatorKind, VariadicArg, comprehension_binder, evaluate_sequence,
-    member_access, normalize_base,
+    MemberAccessError, MemberField, Sequence, TypeOperatorKind, VariadicArg, comprehension_binder,
+    evaluate_sequence, member_access, normalize_base,
 };
 use crate::types::{BoundTypeVarInstance, SpecialFormType, Type, TypeContext, TypeOperatorType};
 
@@ -52,7 +57,7 @@ impl<'a> Visitor<'a> for TargetExpressions<'a> {
 }
 
 /// Returns the leftmost name of a dotted name (`a` for `a.b.c`).
-fn dotted_name_root(expression: &ast::Expr) -> Option<&ast::ExprName> {
+pub(super) fn dotted_name_root(expression: &ast::Expr) -> Option<&ast::ExprName> {
     match expression {
         ast::Expr::Name(name) => Some(name),
         ast::Expr::Attribute(attribute) => dotted_name_root(&attribute.value),
@@ -466,7 +471,12 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             .iter()
             .enumerate()
             .map(|(index, argument)| {
-                if class_indexes.contains(&index) {
+                if index == 1 && self.is_bare_overloaded_reference(argument) {
+                    // A bare `Overloaded` is valid as the `Base` of `GetArg` / `GetArgs` (P5-34).
+                    let (value_ty, _) = self.infer_type_expression_reference(argument);
+                    self.store_expression_type(argument, value_ty);
+                    value_ty
+                } else if class_indexes.contains(&index) {
                     self.infer_type_operator_class_argument(argument)
                 } else {
                     self.infer_type_expression(argument)
@@ -485,6 +495,17 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             );
             None
         }
+    }
+
+    /// Returns `true` if `argument` is a reference to the `Overloaded` special form.
+    fn is_bare_overloaded_reference(&mut self, argument: &ast::Expr) -> bool {
+        is_dotted_name(argument)
+            && dotted_name_root(argument).is_some_and(|root| self.type_binder(&root.id).is_none())
+            && self
+                .speculate_without_diagnostics()
+                .infer_type_expression_reference(argument)
+                .0
+                == Type::SpecialForm(SpecialFormType::Overloaded)
     }
 
     /// Infer the `T` or `Base` argument of `GetArg` / `GetArgs`, or an operand of
@@ -723,6 +744,27 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 };
                 self.evaluate_type_operator(kind, subscript)
             }
+            SpecialFormType::Overloaded => self.infer_overloaded_special_form(subscript),
+            SpecialFormType::GenericCallable => self.infer_generic_callable_special_form(subscript),
+            SpecialFormType::GetAnnotations | SpecialFormType::DropAnnotations => {
+                self.infer_annotation_operator_type_expression(subscript, special_form)
+            }
+            SpecialFormType::UpdateClass => {
+                // `UpdateClass` (phase 5b) is not evaluated yet; its arguments are still inferred.
+                let arguments_slice = &*subscript.slice;
+                let arguments = if let ast::Expr::Tuple(tuple) = arguments_slice {
+                    &*tuple.elts
+                } else {
+                    std::slice::from_ref(arguments_slice)
+                };
+                self.infer_variadic_type_arguments(arguments);
+                if let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, subscript) {
+                    diagnostic::add_type_expression_reference_link(
+                        builder.into_diagnostic("`UpdateClass` is not supported yet"),
+                    );
+                }
+                Type::unknown()
+            }
             _ => unreachable!("not a PEP 827 type-operator special form: {special_form:?}"),
         }
     }
@@ -750,7 +792,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
     /// Infer the arguments of a variadic position (`NewProtocol[...]`, `NewTypedDict[...]`),
     /// where arguments may be unpacked with `*`. An invalid unpack (already reported) becomes
     /// `Unknown`.
-    fn infer_variadic_type_arguments(
+    pub(super) fn infer_variadic_type_arguments(
         &mut self,
         arguments: &[ast::Expr],
     ) -> Box<[VariadicArg<'db>]> {
@@ -849,7 +891,9 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 .ok()?
                 .resolve_type_alias(db);
             let intercept = match field {
-                None => member_args(db, env, as_type).is_some(),
+                None => {
+                    member_args(db, env, as_type).is_some() || is_param_instance(db, env, as_type)
+                }
                 Some(_) => match as_type {
                     Type::Dynamic(_) | Type::Never | Type::TypeOperator(_) | Type::Union(_) => true,
                     Type::TypeVar(typevar) => {
@@ -857,6 +901,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                     }
                     _ => {
                         member_args(db, env, as_type).is_some()
+                            || is_param_instance(db, env, as_type)
                             || !self.is_type_form_attribute(value_ty, &attribute.attr.id)
                     }
                 },
@@ -871,8 +916,9 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             if let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, attribute) {
                 diagnostic::add_type_expression_reference_link(builder.into_diagnostic(
                     format_args!(
-                        "`{}` is not a component of `Member`; expected one of `name`, `type`, \
-                        `quals`, `init` or `definer`",
+                        "`{}` is not a component of `Member` or `Param`; expected one of `name`, \
+                        `type`, `quals`, `init` or `definer` (`Member`), or `name`, `type`, \
+                        `kind` or `default` (`Param`)",
                         attribute.attr.id,
                     ),
                 ));
@@ -882,13 +928,22 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
 
         Some(match member_access(db, env, left, field) {
             Ok(ty) => ty,
-            Err(()) => {
+            Err(MemberAccessError::NotAComponent { class_name }) => {
+                if let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, attribute) {
+                    diagnostic::add_type_expression_reference_link(builder.into_diagnostic(
+                        MemberAccessError::not_a_component_message(field, class_name),
+                    ));
+                }
+                Type::unknown()
+            }
+            Err(MemberAccessError::NotMemberOrParam) => {
                 if !left.is_unknown()
                     && let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, attribute)
                 {
                     diagnostic::add_type_expression_reference_link(builder.into_diagnostic(
                         format_args!(
-                            "`.{}` in a type expression requires a `Member` type, not `{}`",
+                            "`.{}` in a type expression requires a `Member` or `Param` type, \
+                            not `{}`",
                             attribute.attr.id,
                             left.display(db, env),
                         ),
@@ -917,5 +972,114 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                     )
                     .is_ok()
             })
+    }
+}
+
+/// The parameter list of a `Callable[...]` (or of the `ParamSpec` argument of a generic class)
+/// written with `Params` (PEP 827 extended callables).
+pub(super) enum ExtendedParameters<'db> {
+    /// The parameter list is known.
+    Known(Parameters<'db>),
+    /// The parameter list depends on unsolved type variables; the arguments of `Params` are kept
+    /// for a deferred `ExtendedCallable`.
+    Deferred(Box<[VariadicArg<'db>]>),
+    /// The callable is this dynamic type (an invalid `Param` that has already been reported, or a
+    /// raised error).
+    Dynamic(Type<'db>),
+    /// The parameter list is invalid; the error has been reported.
+    Invalid,
+}
+
+impl<'db> TypeInferenceBuilder<'db, '_> {
+    /// Infer `Overloaded[C1, C2, ...]` in a type expression (P5-12).
+    fn infer_overloaded_special_form(&mut self, subscript: &ast::ExprSubscript) -> Type<'db> {
+        let arguments_slice = &*subscript.slice;
+        let arguments = if let ast::Expr::Tuple(tuple) = arguments_slice {
+            &*tuple.elts
+        } else {
+            std::slice::from_ref(arguments_slice)
+        };
+        let arguments = self.infer_variadic_type_arguments(arguments);
+        if arguments.iter().any(|argument| argument.ty().is_unknown()) {
+            return Type::unknown();
+        }
+        self.evaluate_type_operator(TypeOperatorKind::OverloadedOf(arguments), subscript)
+    }
+
+    /// Returns `true` if `ty` is the `ty_extensions.Params` class.
+    pub(super) fn is_params_class(&self, ty: Type<'db>) -> bool {
+        ty.as_class_literal()
+            .is_some_and(|class| class.known(self.db()) == Some(KnownClass::TyExtensionsParams))
+    }
+
+    /// Infer the arguments of `Params[...]` (a variadic position, P5-3) where it describes a
+    /// parameter list, and convert them. The value of `subscript` has already been inferred.
+    pub(super) fn infer_params_subscript_parameters(
+        &mut self,
+        subscript: &ast::ExprSubscript,
+    ) -> ExtendedParameters<'db> {
+        let arguments_slice = &*subscript.slice;
+        let arguments = if let ast::Expr::Tuple(tuple) = arguments_slice {
+            &*tuple.elts
+        } else {
+            std::slice::from_ref(arguments_slice)
+        };
+        let arguments = self.infer_variadic_type_arguments(arguments);
+        if arguments_slice.is_tuple_expr() {
+            self.store_expression_type(arguments_slice, Type::unknown());
+        }
+        if arguments.iter().any(|argument| argument.ty().is_unknown()) {
+            return ExtendedParameters::Invalid;
+        }
+        self.convert_extended_parameters(arguments, subscript)
+    }
+
+    /// Converts a type that describes a whole parameter list (a `Params[...]` instance, e.g. from
+    /// a type alias or `GetArg[F, Callable, Literal[0]]`) into a parameter list. Returns `None`
+    /// if `ty` does not describe a parameter list.
+    pub(super) fn params_type_parameters(
+        &mut self,
+        ty: Type<'db>,
+        node: &ast::Expr,
+    ) -> Option<ExtendedParameters<'db>> {
+        let db = self.db();
+        let env = self.program_environment();
+        let resolved = ty.resolve_type_alias(db);
+        let elements = if let Some(elements) = params_elements(db, env, resolved) {
+            elements
+        } else if matches!(resolved, Type::TypeOperator(operator) if !operator.kind(db).is_inert())
+        {
+            // An unresolved operator that will evaluate to a `Params`: its elements are
+            // `GetArgs[ty, Params]`.
+            let params_class = KnownClass::TyExtensionsParams.to_class_literal(db, env);
+            TypeOperatorType::evaluate_or_defer(
+                db,
+                env,
+                TypeOperatorKind::GetArgs(ty, params_class),
+            )
+        } else {
+            return None;
+        };
+        Some(self.convert_extended_parameters(Box::new([VariadicArg::Unpacked(elements)]), node))
+    }
+
+    fn convert_extended_parameters(
+        &self,
+        arguments: Box<[VariadicArg<'db>]>,
+        node: impl Ranged,
+    ) -> ExtendedParameters<'db> {
+        match parameters_from_params(self.db(), self.program_environment(), &arguments) {
+            Ok(ParamsConversion::Parameters(parameters)) => ExtendedParameters::Known(parameters),
+            Ok(ParamsConversion::Deferred) => ExtendedParameters::Deferred(arguments),
+            Ok(ParamsConversion::Dynamic(dynamic)) => ExtendedParameters::Dynamic(dynamic),
+            Err(error) => {
+                if let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, node) {
+                    diagnostic::add_type_expression_reference_link(
+                        builder.into_diagnostic(error.message()),
+                    );
+                }
+                ExtendedParameters::Invalid
+            }
+        }
     }
 }

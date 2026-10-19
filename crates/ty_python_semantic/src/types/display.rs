@@ -31,7 +31,9 @@ use crate::types::signatures::{Parameter, Parameters, ParametersKind, Signature}
 use crate::types::tuple::{TupleSpec, VariableSegment};
 use crate::types::type_alias::QualifiedTypeAliasName;
 use crate::types::type_arguments::base_display_name;
-use crate::types::type_operator::{TypeOperatorKind, TypeOperatorType, VariadicArg};
+use crate::types::type_operator::{
+    AnnotationSource, TypeOperatorKind, TypeOperatorType, VariadicArg,
+};
 use crate::types::typevar::BoundTypeVarIdentity;
 use crate::types::visitor::TypeVisitor;
 use crate::types::{
@@ -1193,7 +1195,14 @@ fn type_operator_precedence<'db>(db: &'db dyn Db, ty: Type<'db>) -> u8 {
             | TypeOperatorKind::Concat(..)
             | TypeOperatorKind::GetSpecialAttr(..)
             | TypeOperatorKind::RaiseError { .. }
-            | TypeOperatorKind::Quantifier { .. } => 4,
+            | TypeOperatorKind::Quantifier { .. }
+            | TypeOperatorKind::GetAnnotations(_)
+            | TypeOperatorKind::DropAnnotations(_)
+            | TypeOperatorKind::GenericCallable { .. }
+            | TypeOperatorKind::ExtendedCallable { .. }
+            | TypeOperatorKind::OverloadedOf(_) => 4,
+            // Displayed as its inner type.
+            TypeOperatorKind::Annotated { inner, .. } => type_operator_precedence(db, *inner),
         },
         _ => 4,
     }
@@ -1458,6 +1467,63 @@ fn fmt_type_operator<'db>(
                 }
             }
             f.write_char(')')
+        }
+        TypeOperatorKind::GetAnnotations(source) | TypeOperatorKind::DropAnnotations(source) => {
+            let form = if matches!(operator.kind(db), TypeOperatorKind::GetAnnotations(_)) {
+                SpecialFormType::GetAnnotations
+            } else {
+                SpecialFormType::DropAnnotations
+            };
+            f.with_type(Type::SpecialForm(form))
+                .write_str(form.name())?;
+            f.write_char('[')?;
+            match *source {
+                AnnotationSource::MemberType(member) => {
+                    operand(f, member, 4)?;
+                    f.write_str(".type")?;
+                }
+                AnnotationSource::GetMemberType(ty, name) => {
+                    special_form(f, SpecialFormType::GetMemberType, &[ty, name])?;
+                }
+            }
+            f.write_char(']')
+        }
+        TypeOperatorKind::ExtendedCallable { params, return_ty } => {
+            f.with_type(Type::SpecialForm(SpecialFormType::TypingCallable))
+                .write_str("Callable")?;
+            f.write_char('[')?;
+            variadic(f, "Params", None, params)?;
+            f.write_str(", ")?;
+            operand(f, *return_ty, 0)?;
+            f.write_char(']')
+        }
+        TypeOperatorKind::OverloadedOf(args) => variadic(
+            f,
+            SpecialFormType::Overloaded.name(),
+            Some(SpecialFormType::Overloaded),
+            args,
+        ),
+        // An inert `Annotated` type is displayed as its inner type: the metadata is invisible.
+        TypeOperatorKind::Annotated { inner, .. } => inner
+            .display_with(db, env, settings.clone())
+            .fmt_detailed(f),
+        TypeOperatorKind::GenericCallable { binders, body } => {
+            let names = || {
+                binders
+                    .iter()
+                    .map(|binder| binder.typevar(db).name(db).as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            f.with_type(Type::SpecialForm(SpecialFormType::GenericCallable))
+                .write_str(SpecialFormType::GenericCallable.name())?;
+            f.write_str("[tuple[")?;
+            f.write_str(&names())?;
+            f.write_str("], lambda ")?;
+            f.write_str(&names())?;
+            f.write_str(": ")?;
+            operand(f, *body, 0)?;
+            f.write_char(']')
         }
     }
 }

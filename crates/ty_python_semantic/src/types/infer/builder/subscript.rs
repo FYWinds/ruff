@@ -6,6 +6,7 @@ use ruff_text_size::Ranged;
 use ty_module_resolver::file_to_module;
 
 use super::TypeInferenceBuilder;
+use super::type_comprehension::ExtendedParameters;
 use crate::place::{DefinedPlace, Definedness, Place};
 use crate::types::call::CallErrorKind;
 use crate::types::call::bind::CallableDescription;
@@ -536,6 +537,18 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     .inference_flags
                     .replace(InferenceFlags::DISABLE_INT_FLOAT_SPECIAL_CASE, true)
             });
+
+        // PEP 827: `GenericCallable[...]` may only be written directly as the type argument `T`
+        // of `Member[N, T, ...]` (phase 5, P5-15).
+        if generic_class.known(db) == Some(KnownClass::TyExtensionsMember)
+            && let ast::Expr::Tuple(tuple) = &*subscript.slice
+            && let Some(type_argument) = tuple.elts.get(1)
+        {
+            self.store_type_expression_flags(
+                type_argument,
+                TypeExpressionFlags::GENERIC_CALLABLE_POSITION,
+            );
+        }
 
         let result = self.infer_explicit_callable_specialization(
             subscript,
@@ -1307,6 +1320,28 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         db,
                         self.infer_concatenate_special_form(subscript),
                     ));
+                }
+
+                // `classmethod[C, Params[...], R]` / `staticmethod[Params[...], R]` (P5-10).
+                if self.is_params_class(value_ty) {
+                    let parameters = match self.infer_params_subscript_parameters(subscript) {
+                        ExtendedParameters::Known(parameters) => parameters,
+                        ExtendedParameters::Deferred(_) => {
+                            if let Some(builder) =
+                                self.context.report_lint(&INVALID_TYPE_FORM, subscript)
+                            {
+                                builder.into_diagnostic(
+                                    "A `Params` whose parameters depend on type variables is not \
+                                     supported as a `ParamSpec` argument yet",
+                                );
+                            }
+                            Parameters::unknown()
+                        }
+                        ExtendedParameters::Dynamic(_) | ExtendedParameters::Invalid => {
+                            Parameters::unknown()
+                        }
+                    };
+                    return Ok(Type::paramspec_value_callable(db, parameters));
                 }
 
                 // Non-Concatenate subscript: fall back to todo

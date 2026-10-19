@@ -135,6 +135,16 @@ pub enum SpecialFormType {
     GetSpecialAttr,
     /// The symbol `ty_extensions.RaiseError` (PEP 827 type-level error)
     RaiseError,
+    /// The symbol `ty_extensions.Overloaded` (PEP 827 overloaded function types)
+    Overloaded,
+    /// The symbol `ty_extensions.GenericCallable` (PEP 827 generic callables)
+    GenericCallable,
+    /// The symbol `ty_extensions.GetAnnotations` (PEP 827 `Annotated` introspection)
+    GetAnnotations,
+    /// The symbol `ty_extensions.DropAnnotations` (PEP 827 `Annotated` introspection)
+    DropAnnotations,
+    /// The symbol `ty_extensions.UpdateClass` (PEP 827 class updates)
+    UpdateClass,
     /// The symbol `ty_extensions._internal.TypeOf`
     TypeOf,
     /// The symbol `ty_extensions._internal.CallableTypeOf`
@@ -250,6 +260,11 @@ impl SpecialFormType {
             | Self::Concat
             | Self::GetSpecialAttr
             | Self::RaiseError
+            | Self::Overloaded
+            | Self::GenericCallable
+            | Self::GetAnnotations
+            | Self::DropAnnotations
+            | Self::UpdateClass
             | Self::CallableTypeOf
             | Self::RegularCallableTypeOf
             | Self::Unknown
@@ -425,6 +440,11 @@ impl SpecialFormType {
             Concat,
             GetSpecialAttr,
             RaiseError,
+            Overloaded,
+            GenericCallable,
+            GetAnnotations,
+            DropAnnotations,
+            UpdateClass,
             TypeOf,
             CallableTypeOf,
             RegularCallableTypeOf,
@@ -495,6 +515,11 @@ impl SpecialFormType {
                     SpecialFormType::Concat => Self::Concat,
                     SpecialFormType::GetSpecialAttr => Self::GetSpecialAttr,
                     SpecialFormType::RaiseError => Self::RaiseError,
+                    SpecialFormType::Overloaded => Self::Overloaded,
+                    SpecialFormType::GenericCallable => Self::GenericCallable,
+                    SpecialFormType::GetAnnotations => Self::GetAnnotations,
+                    SpecialFormType::DropAnnotations => Self::DropAnnotations,
+                    SpecialFormType::UpdateClass => Self::UpdateClass,
                     SpecialFormType::Literal => Self::Literal,
                     SpecialFormType::LiteralString => Self::LiteralString,
                     SpecialFormType::Never => Self::Never,
@@ -578,6 +603,11 @@ impl SpecialFormType {
                     SpecialFormTypeBuilder::Concat => &[Self::Concat],
                     SpecialFormTypeBuilder::GetSpecialAttr => &[Self::GetSpecialAttr],
                     SpecialFormTypeBuilder::RaiseError => &[Self::RaiseError],
+                    SpecialFormTypeBuilder::Overloaded => &[Self::Overloaded],
+                    SpecialFormTypeBuilder::GenericCallable => &[Self::GenericCallable],
+                    SpecialFormTypeBuilder::GetAnnotations => &[Self::GetAnnotations],
+                    SpecialFormTypeBuilder::DropAnnotations => &[Self::DropAnnotations],
+                    SpecialFormTypeBuilder::UpdateClass => &[Self::UpdateClass],
                     SpecialFormTypeBuilder::Literal => &[Self::Literal],
                     SpecialFormTypeBuilder::LiteralString => &[Self::LiteralString],
                     SpecialFormTypeBuilder::Never => &[Self::Never],
@@ -716,7 +746,12 @@ impl SpecialFormType {
             | Self::Uncapitalize
             | Self::Concat
             | Self::GetSpecialAttr
-            | Self::RaiseError => module.is_ty_extensions(),
+            | Self::RaiseError
+            | Self::Overloaded
+            | Self::GenericCallable
+            | Self::GetAnnotations
+            | Self::DropAnnotations
+            | Self::UpdateClass => module.is_ty_extensions(),
 
             Self::Unknown
             | Self::Divergent
@@ -814,6 +849,11 @@ impl SpecialFormType {
             | Self::Concat
             | Self::GetSpecialAttr
             | Self::RaiseError
+            | Self::Overloaded
+            | Self::GenericCallable
+            | Self::GetAnnotations
+            | Self::DropAnnotations
+            | Self::UpdateClass
             | Self::TypeOf
             | Self::CallableTypeOf
             | Self::RegularCallableTypeOf
@@ -875,6 +915,11 @@ impl SpecialFormType {
             | Self::Concat
             | Self::GetSpecialAttr
             | Self::RaiseError
+            | Self::Overloaded
+            | Self::GenericCallable
+            | Self::GetAnnotations
+            | Self::DropAnnotations
+            | Self::UpdateClass
             | Self::Literal
             | Self::LiteralString
             | Self::Never
@@ -962,6 +1007,11 @@ impl SpecialFormType {
             SpecialFormType::Concat => "Concat",
             SpecialFormType::GetSpecialAttr => "GetSpecialAttr",
             SpecialFormType::RaiseError => "RaiseError",
+            SpecialFormType::Overloaded => "Overloaded",
+            SpecialFormType::GenericCallable => "GenericCallable",
+            SpecialFormType::GetAnnotations => "GetAnnotations",
+            SpecialFormType::DropAnnotations => "DropAnnotations",
+            SpecialFormType::UpdateClass => "UpdateClass",
             SpecialFormType::TypeOf => "TypeOf",
             SpecialFormType::CallableTypeOf => "CallableTypeOf",
             SpecialFormType::RegularCallableTypeOf => "RegularCallableTypeOf",
@@ -1036,6 +1086,11 @@ impl SpecialFormType {
             | SpecialFormType::Concat
             | SpecialFormType::GetSpecialAttr
             | SpecialFormType::RaiseError
+            | SpecialFormType::Overloaded
+            | SpecialFormType::GenericCallable
+            | SpecialFormType::GetAnnotations
+            | SpecialFormType::DropAnnotations
+            | SpecialFormType::UpdateClass
             | SpecialFormType::Top
             | SpecialFormType::Bottom => &[KnownModule::TyExtensions],
 
@@ -1181,7 +1236,9 @@ impl SpecialFormType {
             | Self::Intersection
             | Self::NewProtocol
             | Self::NewTypedDict
-            | Self::RaiseError => Err(InvalidTypeExpression::RequiresArguments(self)),
+            | Self::RaiseError
+            | Self::Overloaded
+            | Self::UpdateClass => Err(InvalidTypeExpression::RequiresArguments(self)),
 
             Self::Protocol => Err(InvalidTypeExpression::Protocol),
             Self::Generic => Err(InvalidTypeExpression::Generic),
@@ -1203,7 +1260,8 @@ impl SpecialFormType {
             | Self::GetArgs
             | Self::Slice
             | Self::Concat
-            | Self::GetSpecialAttr => Err(InvalidTypeExpression::RequiresTwoArguments(self)),
+            | Self::GetSpecialAttr
+            | Self::GenericCallable => Err(InvalidTypeExpression::RequiresTwoArguments(self)),
 
             Self::Optional
             | Self::Not
@@ -1224,7 +1282,9 @@ impl SpecialFormType {
             | Self::TypeGuard
             | Self::Unpack
             | Self::CallableTypeOf
-            | Self::RegularCallableTypeOf => Err(InvalidTypeExpression::RequiresOneArgument(self)),
+            | Self::RegularCallableTypeOf
+            | Self::GetAnnotations
+            | Self::DropAnnotations => Err(InvalidTypeExpression::RequiresOneArgument(self)),
 
             // We treat `typing.Type` exactly the same as `builtins.type`:
             SpecialFormType::Type => Ok(KnownClass::Type.to_instance(db, env)),

@@ -24,8 +24,8 @@ use ty_python_semantic::types::ide_support::{
 };
 use ty_python_semantic::{Db as SemanticDb, ResolvedDefinition};
 use ty_python_semantic::{
-    HasDefinition, HasType, ImportAliasResolution, ProgramEnvironment, SemanticModel,
-    TypeQualifiers, definitions_for_imported_symbol, definitions_for_name,
+    HasDefinition, HasOptionalDefinition, HasType, ImportAliasResolution, ProgramEnvironment,
+    SemanticModel, TypeQualifiers, definitions_for_imported_symbol, definitions_for_name,
     fixture_bindings_for_parameter,
 };
 
@@ -347,9 +347,12 @@ impl<'db> Definitions<'db> {
     ) -> Option<Definitions<'db>> {
         let mut definitions = self;
 
-        if let GotoTarget::Parameter(parameter) = goto_target {
-            let fixture_bindings =
-                fixture_bindings_for_parameter(model.db(), parameter.definition(model));
+        // The parameters of a lambda in a type expression (PEP 827 `GenericCallable`) have no
+        // definition.
+        if let GotoTarget::Parameter(parameter) = goto_target
+            && let Some(definition) = parameter.optional_definition(model)
+        {
+            let fixture_bindings = fixture_bindings_for_parameter(model.db(), definition);
 
             if !fixture_bindings.is_empty() {
                 definitions = Self::new(
@@ -657,9 +660,9 @@ impl GotoTarget<'_> {
                 class.definition(model),
             )]),
 
-            GotoTarget::Parameter(parameter) => Some(vec![ResolvedDefinition::Definition(
-                parameter.definition(model),
-            )]),
+            GotoTarget::Parameter(parameter) => parameter
+                .optional_definition(model)
+                .map(|definition| vec![ResolvedDefinition::Definition(definition)]),
 
             // For import aliases (offset within 'y' or 'z' in "from x import y as z")
             GotoTarget::ImportSymbolAlias { asname, .. } => Some(definitions_for_name(

@@ -3,7 +3,8 @@
 
 import collections.abc
 import sys
-from typing import Any, ClassVar, Generic, Literal, Protocol, _SpecialForm, final
+from enum import IntEnum
+from typing import Any, ClassVar, Generic, Literal, Protocol, TypedDict, _SpecialForm, final
 
 from typing_extensions import (  # ruff: ignore[deprecated-import]
     LiteralString,
@@ -11,6 +12,8 @@ from typing_extensions import (  # ruff: ignore[deprecated-import]
     Self,
     TypeAlias,
     TypeVar,
+    TypeVarTuple,
+    Unpack,
 )
 
 from ._internal import TypeOf as _TypeOf
@@ -346,6 +349,143 @@ class Member(Generic[_MemberN, _MemberT, _MemberQ, _MemberI, _MemberD]):
     def init(self) -> _MemberI: ...
     @property
     def definer(self) -> _MemberD: ...
+
+@final
+class ParamKind(IntEnum):
+    """
+    The kind of a parameter in an experimental [PEP 827] extended callable (`Param[N, T, K, D]`).
+
+    [PEP 827]: https://peps.python.org/pep-0827/
+    """
+
+    POSITIONAL_ONLY = 0
+    POSITIONAL_OR_KEYWORD = 1
+    VAR_POSITIONAL = 2
+    KEYWORD_ONLY = 3
+    VAR_KEYWORD = 4
+
+_ParamN = TypeVar("_ParamN", bound=str | None, covariant=True)
+_ParamT = TypeVar("_ParamT", covariant=True)
+_ParamK = TypeVar(
+    "_ParamK", bound=ParamKind, default=Literal[ParamKind.POSITIONAL_OR_KEYWORD], covariant=True
+)
+_ParamD = TypeVar("_ParamD", default=Never, covariant=True)
+
+@final
+class Param(Generic[_ParamN, _ParamT, _ParamK, _ParamD]):
+    """
+    `Param[N, T, K, D]` is an experimental [PEP 827] description of a callable parameter: its name
+    `N` (a string literal type, or `None` for a parameter without a name), its type `T`, its kind
+    `K` (a `ParamKind` literal type), and the type of its default value `D` (`Never` if it has no
+    default).
+
+    In type expressions, the components can be accessed with `p.name`, `p.type`, `p.kind` and
+    `p.default`.
+
+    [PEP 827]: https://peps.python.org/pep-0827/
+    """
+
+    @property
+    def name(self) -> _ParamN: ...
+    @property
+    def type(self) -> _ParamT: ...
+    @property
+    def kind(self) -> _ParamK: ...
+    @property
+    def default(self) -> _ParamD: ...
+
+_ParamsPs = TypeVarTuple("_ParamsPs")
+
+@final
+class Params(Generic[Unpack[_ParamsPs]]):
+    """
+    `Params[*Ps]` is an experimental [PEP 827] parameter list: a sequence of `Param` types. As the
+    first argument of `Callable`, it describes the parameters of the callable
+    (`Callable[Params[Param[Literal["x"], int]], None]` is `(x: int) -> None`).
+
+    [PEP 827]: https://peps.python.org/pep-0827/
+    """
+
+_AliasN = TypeVar("_AliasN", bound=str)
+_AliasT = TypeVar("_AliasT")
+
+PosParam: TypeAlias = Param[None, _AliasT, Literal[ParamKind.POSITIONAL_ONLY]]
+"""A positional-only parameter without a default ([PEP 827](https://peps.python.org/pep-0827/))."""
+PosDefaultParam: TypeAlias = Param[None, _AliasT, Literal[ParamKind.POSITIONAL_ONLY], _AliasT]
+"""A positional-only parameter with a default ([PEP 827](https://peps.python.org/pep-0827/))."""
+DefaultParam: TypeAlias = Param[_AliasN, _AliasT, Literal[ParamKind.POSITIONAL_OR_KEYWORD], _AliasT]
+"""A parameter with a default ([PEP 827](https://peps.python.org/pep-0827/))."""
+NamedParam: TypeAlias = Param[_AliasN, _AliasT, Literal[ParamKind.KEYWORD_ONLY]]
+"""A keyword-only parameter without a default ([PEP 827](https://peps.python.org/pep-0827/))."""
+NamedDefaultParam: TypeAlias = Param[_AliasN, _AliasT, Literal[ParamKind.KEYWORD_ONLY], _AliasT]
+"""A keyword-only parameter with a default ([PEP 827](https://peps.python.org/pep-0827/))."""
+ArgsParam: TypeAlias = Param[None, _AliasT, Literal[ParamKind.VAR_POSITIONAL]]
+"""A `*args` parameter ([PEP 827](https://peps.python.org/pep-0827/))."""
+KwargsParam: TypeAlias = Param[None, _AliasT, Literal[ParamKind.VAR_KEYWORD]]
+"""A `**kwargs` parameter ([PEP 827](https://peps.python.org/pep-0827/))."""
+
+Overloaded: _SpecialForm
+"""
+`Overloaded[C1, C2, ...]` is the experimental [PEP 827] type of an overloaded function whose
+signatures are the callable types `C1`, `C2`, ... in order. Without arguments, it can be used as
+the `Base` argument of `GetArg` and `GetArgs` to inspect the signatures of a callable.
+
+[PEP 827]: https://peps.python.org/pep-0827/
+"""
+
+GenericCallable: _SpecialForm
+"""
+`GenericCallable[tuple[T1, ...], lambda t1, ...: C]` is the experimental [PEP 827] type of a
+generic callable with its own type parameters. It is only allowed as the type argument of a
+`Member`.
+
+[PEP 827]: https://peps.python.org/pep-0827/
+"""
+
+GetAnnotations: _SpecialForm
+"""
+`GetAnnotations[T]` is an experimental [PEP 827] operator: the union of the types of the metadata
+of `Annotated[X, m1, m2, ...]`, or `Never` if `T` is not `Annotated`.
+
+[PEP 827]: https://peps.python.org/pep-0827/
+"""
+
+DropAnnotations: _SpecialForm
+"""
+`DropAnnotations[T]` is an experimental [PEP 827] operator: `T` without its `Annotated` wrapper.
+
+[PEP 827]: https://peps.python.org/pep-0827/
+"""
+
+UpdateClass: _SpecialForm
+"""
+`UpdateClass[*Ms]` is an experimental [PEP 827] return type of class decorators and of
+`__init_subclass__`: it adds, replaces or removes the members `Ms` (`Member` types) of the class.
+
+[PEP 827]: https://peps.python.org/pep-0827/
+"""
+
+class BaseTypedDict(TypedDict):
+    """
+    The experimental [PEP 827] base of all `TypedDict` types, for use as the bound of a type
+    variable in `**kwargs: Unpack[K]`.
+
+    [PEP 827]: https://peps.python.org/pep-0827/
+    """
+
+_KwargDict = TypeVar("_KwargDict", bound=BaseTypedDict)
+
+class InitField(Generic[_KwargDict]):
+    """
+    An experimental [PEP 827] field descriptor: the keyword arguments of its construction are
+    inferred as a `TypedDict` with literal types (`KwargDict`), and become the `init` component of
+    the `Member` that describes the field.
+
+    [PEP 827]: https://peps.python.org/pep-0827/
+    """
+
+    def __init__(self, **kwargs: Unpack[_KwargDict]) -> None: ...
+    def get_kwargs(self) -> _KwargDict: ...
 
 Top: _SpecialForm
 """

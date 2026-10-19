@@ -371,19 +371,19 @@ TypedDi<CURSOR>
       {
         "label": "typing.TypedDict",
         "kind": 6,
-        "sortText": "0",
+        "sortText": " 0",
         "insertText": "typing.TypedDict"
       },
       {
         "label": "typing.is_typeddict",
         "kind": 3,
-        "sortText": "1",
+        "sortText": " 1",
         "insertText": "typing.is_typeddict"
       },
       {
         "label": "TypedDict (import typing_extensions)",
         "kind": 6,
-        "sortText": "2",
+        "sortText": " 2",
         "insertText": "TypedDict",
         "additionalTextEdits": [
           {
@@ -404,7 +404,7 @@ TypedDi<CURSOR>
       {
         "label": "TypedDictFallback (import _typeshed._type_checker_internals)",
         "kind": 7,
-        "sortText": "3",
+        "sortText": " 3",
         "insertText": "TypedDictFallback",
         "additionalTextEdits": [
           {
@@ -423,9 +423,30 @@ TypedDi<CURSOR>
         ]
       },
       {
+        "label": "BaseTypedDict (import ty_extensions)",
+        "kind": 7,
+        "sortText": " 4",
+        "insertText": "BaseTypedDict",
+        "additionalTextEdits": [
+          {
+            "range": {
+              "start": {
+                "line": 0,
+                "character": 0
+              },
+              "end": {
+                "line": 0,
+                "character": 0
+              }
+            },
+            "newText": "from ty_extensions import BaseTypedDict\n"
+          }
+        ]
+      },
+      {
         "label": "NewTypedDict (import ty_extensions)",
         "kind": 6,
-        "sortText": "4",
+        "sortText": " 5",
         "insertText": "NewTypedDict",
         "additionalTextEdits": [
           {
@@ -446,7 +467,7 @@ TypedDi<CURSOR>
       {
         "label": "is_typeddict (import typing_extensions)",
         "kind": 3,
-        "sortText": "5",
+        "sortText": " 6",
         "insertText": "is_typeddict",
         "additionalTextEdits": [
           {
@@ -467,7 +488,7 @@ TypedDi<CURSOR>
       {
         "label": "_FilterConfigurationTypedDict (import logging.config)",
         "kind": 7,
-        "sortText": "6",
+        "sortText": " 7",
         "insertText": "_FilterConfigurationTypedDict",
         "additionalTextEdits": [
           {
@@ -488,7 +509,7 @@ TypedDi<CURSOR>
       {
         "label": "_FormatterConfigurationTypedDict (import logging.config)",
         "kind": 6,
-        "sortText": "7",
+        "sortText": " 8",
         "insertText": "_FormatterConfigurationTypedDict",
         "additionalTextEdits": [
           {
@@ -509,7 +530,7 @@ TypedDi<CURSOR>
       {
         "label": "_typeshed.dbapi (import _typeshed.dbapi)",
         "kind": 9,
-        "sortText": "8",
+        "sortText": " 9",
         "insertText": "_typeshed.dbapi",
         "additionalTextEdits": [
           {
@@ -560,7 +581,7 @@ TypedDi<CURSOR>
       {
         "label": "TypedDict (import typing)",
         "kind": 6,
-        "sortText": "0",
+        "sortText": " 0",
         "insertText": "TypedDict",
         "additionalTextEdits": [
           {
@@ -581,7 +602,7 @@ TypedDi<CURSOR>
       {
         "label": "is_typeddict (import typing)",
         "kind": 3,
-        "sortText": "1",
+        "sortText": " 1",
         "insertText": "is_typeddict",
         "additionalTextEdits": [
           {
@@ -602,7 +623,7 @@ TypedDi<CURSOR>
       {
         "label": "TypedDict (import typing_extensions)",
         "kind": 6,
-        "sortText": "2",
+        "sortText": " 2",
         "insertText": "TypedDict",
         "additionalTextEdits": [
           {
@@ -623,7 +644,7 @@ TypedDi<CURSOR>
       {
         "label": "TypedDictFallback (import _typeshed._type_checker_internals)",
         "kind": 7,
-        "sortText": "3",
+        "sortText": " 3",
         "insertText": "TypedDictFallback",
         "additionalTextEdits": [
           {
@@ -642,9 +663,30 @@ TypedDi<CURSOR>
         ]
       },
       {
+        "label": "BaseTypedDict (import ty_extensions)",
+        "kind": 7,
+        "sortText": " 4",
+        "insertText": "BaseTypedDict",
+        "additionalTextEdits": [
+          {
+            "range": {
+              "start": {
+                "line": 0,
+                "character": 0
+              },
+              "end": {
+                "line": 0,
+                "character": 0
+              }
+            },
+            "newText": "from ty_extensions import BaseTypedDict\n"
+          }
+        ]
+      },
+      {
         "label": "NewTypedDict (import ty_extensions)",
         "kind": 6,
-        "sortText": "4",
+        "sortText": " 5",
         "insertText": "NewTypedDict",
         "additionalTextEdits": [
           {
@@ -665,7 +707,7 @@ TypedDi<CURSOR>
       {
         "label": "is_typeddict (import typing_extensions)",
         "kind": 3,
-        "sortText": "5",
+        "sortText": " 6",
         "insertText": "is_typeddict",
         "additionalTextEdits": [
           {
@@ -686,7 +728,7 @@ TypedDi<CURSOR>
       {
         "label": "_FilterConfigurationTypedDict (import logging.config)",
         "kind": 7,
-        "sortText": "6",
+        "sortText": " 7",
         "insertText": "_FilterConfigurationTypedDict",
         "additionalTextEdits": [
           {
@@ -707,7 +749,7 @@ TypedDi<CURSOR>
       {
         "label": "_FormatterConfigurationTypedDict (import logging.config)",
         "kind": 6,
-        "sortText": "7",
+        "sortText": " 8",
         "insertText": "_FormatterConfigurationTypedDict",
         "additionalTextEdits": [
           {
@@ -728,7 +770,7 @@ TypedDi<CURSOR>
       {
         "label": "_typeshed.dbapi (import _typeshed.dbapi)",
         "kind": 9,
-        "sortText": "8",
+        "sortText": " 9",
         "insertText": "_typeshed.dbapi",
         "additionalTextEdits": [
           {

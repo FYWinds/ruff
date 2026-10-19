@@ -118,7 +118,7 @@ def _(attrs: Attrs[B]):
     reveal_type(attrs)
 ```
 
-`Annotated` metadata is not kept.
+`Annotated` metadata is not displayed, but it can be read with `GetAnnotations`.
 
 ```py
 from typing import Annotated

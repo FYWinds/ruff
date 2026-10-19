@@ -213,8 +213,8 @@ def _(
 
 ## `type` and `Callable` as the base
 
-`type[C]` has the type argument `C`. For a `Callable`, only the return type (index `1` or `-1`) is
-supported for now; the parameter list needs the extended callable types of a later phase.
+`type[C]` has the type argument `C`. For a `Callable`, index `0` (or `-2`) is the parameter list as
+an extended callable `Params[...]`, and index `1` (or `-1`) is the return type.
 
 ```py
 from collections.abc import Callable
@@ -225,20 +225,20 @@ def _(
     a: GetArg[type[int], type, Literal[0]],
     b: GetArg[Callable[[int], str], Callable, Literal[1]],
     c: GetArg[Callable[[int], str], Callable, Literal[-1]],
-    # error: [invalid-type-form] "Getting the parameters of a `Callable` with `GetArg` is not supported yet"
     d: GetArg[Callable[[int], str], Callable, Literal[0]],
-    # error: [invalid-type-form] "Getting the parameters of a `Callable` with `GetArgs` is not supported yet"
     e: GetArgs[Callable[[int], str], Callable],
 ):
     reveal_type(a)  # revealed: int
     reveal_type(b)  # revealed: str
     reveal_type(c)  # revealed: str
-    reveal_type(d)  # revealed: Unknown
+    reveal_type(d)  # revealed: Params[Param[None, int, Literal[ParamKind.POSITIONAL_ONLY], Never]]
+    # revealed: tuple[Params[Param[None, int, Literal[ParamKind.POSITIONAL_ONLY], Never]], str]
+    reveal_type(e)
 ```
 
 A callable whose signature has its own type parameters is rejected: its return type would mention a
 type variable that only means something inside that signature. The synthetic `Self` type variable
-that ty adds to methods is allowed, as long as the return type does not mention it.
+that ty adds to methods is replaced by the class that defines the method.
 
 ```py
 from collections.abc import Callable
@@ -265,13 +265,12 @@ def _(
     b: ReturnOf[GetMemberType[Box[str], Literal["get"]]],
     # error: [invalid-type-form] "Getting the return type of a generic callable with `GetArg` is not supported yet"
     c: GetArg[GetMemberType[Box[str], Literal["first"]], Callable, Literal[-1]],
-    # error: [invalid-type-form] "Getting the return type of a generic callable with `GetArg` is not supported yet"
     d: GetArg[GetMemberType[Box[str], Literal["clone"]], Callable, Literal[-1]],
 ):
     reveal_type(a)  # revealed: int
     reveal_type(b)  # revealed: str
     reveal_type(c)  # revealed: Unknown
-    reveal_type(d)  # revealed: Unknown
+    reveal_type(d)  # revealed: Box[str]
 ```
 
 ## `TypeVarTuple` parameters

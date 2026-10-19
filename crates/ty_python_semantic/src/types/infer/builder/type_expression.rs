@@ -10,6 +10,7 @@ use ruff_python_ast::{self as ast, PythonVersion};
 use ruff_source_file::LineRanges;
 use ruff_text_size::{Ranged, TextRange};
 
+use super::type_comprehension::ExtendedParameters;
 use super::type_operator::{is_type_bool_operand_syntax, type_quantifier_generator};
 use super::{DeferredExpressionState, TypeInferenceBuilder};
 use crate::types::call::CallArguments;
@@ -21,6 +22,7 @@ use crate::types::diagnostic::{
     report_invalid_concatenate_last_arg, report_missing_type_arguments, report_raised_type_errors,
     report_unsupported_binary_operation,
 };
+use crate::types::extended_callable::is_param_instance;
 use crate::types::infer::builder::subscript::AnnotatedExprContext;
 use crate::types::infer::{
     CyclicTypeAliasError, ImplicitAliasInference, InferenceFlags, TypeExpressionFlags,
@@ -970,9 +972,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             }
 
             ast::Expr::Lambda(lambda_expression) => {
-                if !self.in_string_annotation() {
-                    self.infer_lambda_expression(lambda_expression, TypeContext::default());
-                }
+                self.infer_invalid_lambda_type_expression(lambda_expression);
                 self.report_invalid_type_expression(
                     expression,
                     format_args!(
@@ -2499,12 +2499,24 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                     report_invalid_arguments_to_callable(&builder.context, subscript);
                 }
 
-                if correct_argument_number
-                    && let (Some(parameters), Some(return_type)) = (parameters, return_type)
-                {
-                    Type::single_callable(db, Signature::new(parameters, return_type))
-                } else {
-                    Type::Callable(CallableType::unknown(db))
+                match (parameters, return_type) {
+                    (Some(ExtendedParameters::Known(parameters)), Some(return_type))
+                        if correct_argument_number =>
+                    {
+                        Type::single_callable(db, Signature::new(parameters, return_type))
+                    }
+                    // `Callable[Params[...], R]` whose parameter list is not known yet.
+                    (Some(ExtendedParameters::Deferred(params)), Some(return_ty))
+                        if correct_argument_number =>
+                    {
+                        builder.evaluate_type_operator(
+                            TypeOperatorKind::ExtendedCallable { params, return_ty },
+                            subscript,
+                        )
+                    }
+                    (Some(ExtendedParameters::Dynamic(dynamic)), _) => dynamic,
+                    (Some(ExtendedParameters::Invalid), _) => Type::unknown(),
+                    _ => Type::Callable(CallableType::unknown(db)),
                 }
             };
 
@@ -2674,7 +2686,12 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             | SpecialFormType::Uncapitalize
             | SpecialFormType::Concat
             | SpecialFormType::GetSpecialAttr
-            | SpecialFormType::RaiseError => {
+            | SpecialFormType::RaiseError
+            | SpecialFormType::Overloaded
+            | SpecialFormType::GenericCallable
+            | SpecialFormType::GetAnnotations
+            | SpecialFormType::DropAnnotations
+            | SpecialFormType::UpdateClass => {
                 self.infer_type_operator_special_form_type_expression(subscript, special_form)
             }
             SpecialFormType::Not => {
@@ -3337,18 +3354,18 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
     }
 
     /// Infer the first argument to a `typing.Callable` type expression and returns the
-    /// corresponding [`Parameters`].
+    /// corresponding parameter list (an [`ExtendedParameters`] for `Params[...]`, P5-2).
     ///
     /// It returns `None` if the argument is invalid i.e., not a list of types, parameter
-    /// specification, `typing.Concatenate`, or `...`.
+    /// specification, `typing.Concatenate`, `Params`, or `...`.
     fn infer_callable_parameter_types(
         &mut self,
         parameters: &ast::Expr,
-    ) -> Option<Parameters<'db>> {
+    ) -> Option<ExtendedParameters<'db>> {
         let db = self.db();
         match parameters {
             ast::Expr::EllipsisLiteral(ast::ExprEllipsisLiteral { .. }) => {
-                return Some(Parameters::gradual_form());
+                return Some(ExtendedParameters::Known(Parameters::gradual_form()));
             }
             ast::Expr::List(ast::ExprList { elts: params, .. }) => {
                 if let [ast::Expr::EllipsisLiteral(_)] = &params[..] {
@@ -3362,8 +3379,12 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                     .context
                     .inference_flags
                     .replace(InferenceFlags::IN_VALID_UNPACK_CONTEXT, true);
+                let mut wrapped_param = None;
                 for param in params {
                     let param_type = self.infer_type_expression(param);
+                    if is_param_instance(db, self.program_environment(), param_type) {
+                        wrapped_param.get_or_insert(param);
+                    }
                     let is_unpack = self
                         .type_expression_flags(param)
                         .contains(TypeExpressionFlags::UNPACK);
@@ -3398,19 +3419,40 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                     previously_in_valid_unpack_context,
                 );
 
-                return Some(Parameters::from_annotation(db, parameters));
+                if let Some(param) = wrapped_param {
+                    if let Some(builder) = self.context.report_lint(&INVALID_TYPE_FORM, param) {
+                        diagnostic::add_type_expression_reference_link(
+                            builder
+                                .into_diagnostic("`Param` types must be wrapped in `Params[...]`"),
+                        );
+                    }
+                    return Some(ExtendedParameters::Invalid);
+                }
+
+                return Some(ExtendedParameters::Known(Parameters::from_annotation(
+                    db, parameters,
+                )));
             }
             ast::Expr::Subscript(subscript) => {
                 let value_ty = self.infer_expression(&subscript.value, TypeContext::default());
 
                 if matches!(value_ty, Type::SpecialForm(SpecialFormType::Concatenate)) {
-                    return Some(self.infer_concatenate_special_form(subscript));
+                    return Some(ExtendedParameters::Known(
+                        self.infer_concatenate_special_form(subscript),
+                    ));
                 }
 
-                self.infer_subscript_type_expression(subscript, value_ty);
+                if self.is_params_class(value_ty) {
+                    return Some(self.infer_params_subscript_parameters(subscript));
+                }
+
+                let ty = self.infer_subscript_type_expression(subscript, value_ty);
+                if let Some(extended) = self.params_type_parameters(ty, parameters) {
+                    return Some(extended);
+                }
 
                 // Non-Concatenate subscript (e.g. Unpack): fall back to todo
-                return Some(Parameters::todo());
+                return Some(ExtendedParameters::Known(Parameters::todo()));
             }
             ast::Expr::Name(_) | ast::Expr::Attribute(_) => {
                 if parameters
@@ -3434,14 +3476,17 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                 if let Type::TypeVar(tvar) = parameters_type
                     && tvar.is_paramspec(self.db())
                 {
-                    return Some(Parameters::paramspec(db, tvar));
+                    return Some(ExtendedParameters::Known(Parameters::paramspec(db, tvar)));
                 }
                 if parameters_type == Type::Dynamic(DynamicType::InvalidConcatenateUnknown) {
                     // Avoid emitting a confusing error here saying that the first argument to
                     // `Callable` must be "Concatenate, `...`, a parameter list or a ParamSpec"
                     // if the first argument *was* in fact `Concatenate` -- it was just used
                     // incorrectly. We'll have emitted an error elsewhere about the invalid use.
-                    return Some(Parameters::unknown());
+                    return Some(ExtendedParameters::Known(Parameters::unknown()));
+                }
+                if let Some(extended) = self.params_type_parameters(parameters_type, parameters) {
+                    return Some(extended);
                 }
             }
             ast::Expr::StringLiteral(string) => {

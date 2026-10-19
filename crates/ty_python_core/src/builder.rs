@@ -3544,17 +3544,14 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
         if self.in_type_expression
             && (matches!(
                 expr,
-                ast::Expr::Lambda(_)
-                    | ast::Expr::SetComp(_)
-                    | ast::Expr::DictComp(_)
-                    | ast::Expr::Generator(_)
+                ast::Expr::SetComp(_) | ast::Expr::DictComp(_) | ast::Expr::Generator(_)
             ) || self
                 .value_expressions_in_type_expression
                 .remove(&ExpressionNodeKey::from(expr)))
         {
-            // Nested scopes (other than PEP 827 type-level list comprehensions, handled below)
-            // and `Annotated` metadata are value expressions, not type expressions; don't leak
-            // the flag into them.
+            // Nested scopes (other than PEP 827 type-level list comprehensions and lambdas,
+            // handled below) and `Annotated` metadata are value expressions, not type
+            // expressions; don't leak the flag into them.
             self.in_type_expression = false;
             self.visit_expr_with_context(expr, context);
             self.in_type_expression = true;
@@ -3585,6 +3582,27 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                 }) => {
                     // PEP 827 type-level comprehension (`*[T for x in Iter[...]]`).
                     self.visit_type_comprehension_parts(elt, generators);
+                    return;
+                }
+                ast::Expr::Lambda(lambda) => {
+                    // PEP 827 `GenericCallable[Vs, lambda <params>: <type>]`: like a type-level
+                    // comprehension, the lambda is evaluated entirely by type inference in the
+                    // enclosing scope. Don't create a lambda scope and don't define the
+                    // parameters: inference resolves their names (as synthetic type variables)
+                    // before any place lookup, so their uses here only leave used-but-unbound
+                    // symbols in the current scope. Default values (which inference rejects) are
+                    // value expressions; the body is walked in the current scope.
+                    if let Some(parameters) = &lambda.parameters {
+                        for default in parameters
+                            .iter_non_variadic_params()
+                            .filter_map(|param| param.default.as_deref())
+                        {
+                            self.value_expressions_in_type_expression
+                                .insert(ExpressionNodeKey::from(default));
+                            self.visit_expr(default);
+                        }
+                    }
+                    self.visit_expr(&lambda.body);
                     return;
                 }
                 ast::Expr::Call(call) => {

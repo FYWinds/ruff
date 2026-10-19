@@ -165,6 +165,10 @@ impl InstanceDictionary {
             | KnownClass::KwOnly
             | KnownClass::NamedTupleLike
             | KnownClass::TyExtensionsMember
+            | KnownClass::TyExtensionsParam
+            | KnownClass::TyExtensionsParams
+            | KnownClass::TyExtensionsParamKind
+            | KnownClass::TyExtensionsInitField
             | KnownClass::TypedDictFallback
             | KnownClass::Template
             | KnownClass::Path

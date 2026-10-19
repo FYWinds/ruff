@@ -1,24 +1,32 @@
 //! Member introspection for [PEP 827] type operators (`Attrs`, `Members`, `GetMember`,
 //! `GetMemberType`) and the `ty_extensions.Member` descriptor class.
 //!
+//! The type argument `T` of a collected attribute whose annotation is written as
+//! `Annotated[X, *metadata]` is the inert [`TypeOperatorKind::Annotated`] operator, so that
+//! `GetAnnotations` can read the metadata; every other reader strips it (see
+//! [`strip_annotated`](super::type_operator::strip_annotated)).
+//!
 //! A class's members are collected in an ordered, qualifier-preserving walk over its MRO,
 //! starting from the most basic class. A subclass that redeclares a member keeps the member's
 //! original position but supplies its type, initializer and definer.
 //!
 //! [PEP 827]: https://peps.python.org/pep-0827/
 
+use ruff_db::parsed::parsed_module;
 use ruff_python_ast::name::Name;
 use ty_module_resolver::{KnownModule, file_to_module};
-use ty_python_core::definition::DefinitionKind;
+use ty_python_core::definition::{Definition, DefinitionKind, DefinitionState};
 use ty_python_core::{place_table, use_def_map};
 
 use super::class::CodeGeneratorKind;
 use super::member::class_member;
 use crate::place::place_from_bindings;
 use crate::reachability::DeclarationsIteratorExtension;
+use crate::types::special_form::SpecialFormType;
+use crate::types::type_operator::{TypeOperatorKind, strip_annotated};
 use crate::types::{
     ClassBase, ClassType, KnownClass, LiteralValueType, StaticClassLiteral, StringLiteralType,
-    Type, TypedDictType, UnionType,
+    Type, TypeOperatorType, TypedDictType, UnionType, definition_expression_type,
 };
 use crate::{Db, FxIndexMap, ProgramEnvironment, TypeQualifiers};
 
@@ -267,7 +275,14 @@ fn class_members<'db>(db: &'db dyn Db, class: ClassType<'db>, attrs_only: bool) 
         let definer = Type::instance(db, &env, base_class);
         for own in own_members(db, class_literal) {
             let member = CollectedMember {
-                ty: own.ty.apply_optional_specialization(db, specialization),
+                // A method's retained synthetic `Self` is bounded by the owner, so the owner's
+                // specialization also applies to that bound (P5-7).
+                ty: if own.is_method {
+                    own.ty
+                        .apply_optional_owner_specialization_to_member(db, specialization)
+                } else {
+                    own.ty.apply_optional_specialization(db, specialization)
+                },
                 qualifiers: own.qualifiers,
                 init: own.init.apply_optional_specialization(db, specialization),
                 definer,
@@ -302,7 +317,7 @@ fn class_members<'db>(db: &'db dyn Db, class: ClassType<'db>, attrs_only: bool) 
             .filter(|(_, member)| {
                 // `Attrs` excludes methods: `ClassVar`s with a callable type.
                 let is_method = member.qualifiers.contains(TypeQualifiers::CLASS_VAR)
-                    && is_method_like_type(member.ty);
+                    && is_method_like_type(strip_annotated(db, member.ty));
                 !(attrs_only && is_method)
             })
             .map(|(name, member)| {
@@ -481,12 +496,22 @@ fn own_members<'db>(db: &'db dyn Db, class: StaticClassLiteral<'db>) -> Vec<OwnM
             }
             _ => {
                 // Only annotated assignments describe attributes.
+                // The first reachable one is the declaration whose annotation is read for
+                // `Annotated` metadata.
+                let mut annotated_assignment = None;
                 if !use_def
                     .reachable_symbol_declarations(symbol_id)
-                    .any_reachable(db, |declaration| {
-                        declaration.is_defined_and(|definition| {
-                            matches!(definition.kind(db), DefinitionKind::AnnotatedAssignment(_))
-                        })
+                    .any_reachable(db, |declaration| match declaration {
+                        DefinitionState::Defined(definition)
+                            if matches!(
+                                definition.kind(db),
+                                DefinitionKind::AnnotatedAssignment(_)
+                            ) =>
+                        {
+                            annotated_assignment = Some(definition);
+                            true
+                        }
+                        _ => false,
                     })
                 {
                     continue;
@@ -512,7 +537,8 @@ fn own_members<'db>(db: &'db dyn Db, class: StaticClassLiteral<'db>) -> Vec<OwnM
                 };
                 OwnMember {
                     name: name.clone(),
-                    ty,
+                    ty: annotated_assignment
+                        .map_or(ty, |definition| with_annotated_metadata(db, definition, ty)),
                     qualifiers: member.qualifiers
                         & (TypeQualifiers::CLASS_VAR | TypeQualifiers::FINAL),
                     init: init.unwrap_or(Type::Never),
@@ -525,4 +551,46 @@ fn own_members<'db>(db: &'db dyn Db, class: StaticClassLiteral<'db>) -> Vec<OwnM
 
     members.sort_by_key(|(order, _)| *order);
     members.into_iter().map(|(_, member)| member).collect()
+}
+
+/// Returns `ty` wrapped in the inert [`TypeOperatorKind::Annotated`] operator if the annotation
+/// of `definition` is written as `Annotated[X, *metadata]` (P5-22). The metadata types are the
+/// inferred types of the metadata expressions (literals keep their literal type). Annotations
+/// that only refer to an `Annotated` type (aliases, string annotations) are not recognized.
+fn with_annotated_metadata<'db>(
+    db: &'db dyn Db,
+    definition: Definition<'db>,
+    ty: Type<'db>,
+) -> Type<'db> {
+    let DefinitionKind::AnnotatedAssignment(assignment) = definition.kind(db) else {
+        return ty;
+    };
+    let module = parsed_module(db, definition.python_file(db)).load(db);
+    let Some(subscript) = assignment.annotation(&module).as_subscript_expr() else {
+        return ty;
+    };
+    if definition_expression_type(db, definition, &subscript.value)
+        != Type::SpecialForm(SpecialFormType::Annotated)
+    {
+        return ty;
+    }
+    let Some(metadata) = subscript
+        .slice
+        .as_tuple_expr()
+        .and_then(|tuple| tuple.elts.get(1..))
+        .filter(|metadata| !metadata.is_empty())
+    else {
+        return ty;
+    };
+    let metadata = metadata
+        .iter()
+        .map(|expression| definition_expression_type(db, definition, expression))
+        .collect();
+    Type::TypeOperator(TypeOperatorType::new(
+        db,
+        TypeOperatorKind::Annotated {
+            inner: ty,
+            metadata,
+        },
+    ))
 }

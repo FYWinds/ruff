@@ -5666,6 +5666,34 @@ pub(crate) struct Parameter<'db> {
     kind: ParameterKind<'db>,
 }
 
+/// Returns the type variable `K` of a `**kwargs: Unpack[K]` annotation, if `K` is bounded by a
+/// `TypedDict` or all of its constraints are `TypedDict`s (PEP 827).
+pub(crate) fn unpacked_typed_dict_kwargs_typevar<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    annotated_type: Type<'db>,
+    annotation_flags: TypeExpressionFlags,
+) -> Option<BoundTypeVarInstance<'db>> {
+    if !annotation_flags.contains(TypeExpressionFlags::UNPACK) {
+        return None;
+    }
+    let Type::TypeVar(bound_typevar) = annotated_type else {
+        return None;
+    };
+    let typevar = bound_typevar.typevar(db);
+    if typevar.is_paramspec(db) || typevar.is_typevartuple(db) {
+        return None;
+    }
+    let is_typed_dict = |ty: Type<'db>| ty.resolve_type_alias(db).as_typed_dict().is_some();
+    match typevar.bound_or_constraints(db, env)? {
+        TypeVarBoundOrConstraints::UpperBound(bound) => is_typed_dict(bound),
+        TypeVarBoundOrConstraints::Constraints(constraints) => {
+            constraints.elements(db).iter().copied().all(is_typed_dict)
+        }
+    }
+    .then_some(bound_typevar)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, get_size2::GetSize)]
 enum ParameterAnnotationKind {
     Normal,
@@ -5681,6 +5709,11 @@ enum ParameterAnnotationKind {
 
     /// The parameter was declared as `**kwargs: Unpack[TypedDict]`.
     UnpackedTypedDictKwargs,
+
+    /// The parameter was declared as `**kwargs: Unpack[K]`, where `K` is a type variable bounded
+    /// by a `TypedDict` (PEP 827). The keyword arguments of a call are collected into a
+    /// synthesized `TypedDict`, which is the argument for this parameter.
+    UnpackedTypeVarKwargs,
 }
 
 impl<'db> Parameter<'db> {
@@ -5931,15 +5964,26 @@ impl<'db> Parameter<'db> {
             };
         let has_unpacked_variadic_annotation = matches!(&kind, ParameterKind::Variadic { .. })
             && annotation_flags.contains(TypeExpressionFlags::UNPACK);
-        let is_unpacked_typed_dict_kwargs = matches!(&kind, ParameterKind::KeywordVariadic { .. })
+        let is_keyword_variadic = matches!(&kind, ParameterKind::KeywordVariadic { .. });
+        let annotation_kind = if is_keyword_variadic
             && extract_unpacked_typed_dict_keys_from_kwargs_annotation(
                 db,
                 annotated_type,
                 annotation_flags,
             )
-            .is_some();
-        let annotation_kind = if is_unpacked_typed_dict_kwargs {
+            .is_some()
+        {
             ParameterAnnotationKind::UnpackedTypedDictKwargs
+        } else if is_keyword_variadic
+            && unpacked_typed_dict_kwargs_typevar(
+                db,
+                &ProgramEnvironment::from_definition(function_definition),
+                annotated_type,
+                annotation_flags,
+            )
+            .is_some()
+        {
+            ParameterAnnotationKind::UnpackedTypeVarKwargs
         } else if has_starred_annotation || has_unpacked_variadic_annotation {
             ParameterAnnotationKind::Starred
         } else {
@@ -6030,6 +6074,15 @@ impl<'db> Parameter<'db> {
     /// `*args: *tuple[int, *tuple[str, ...], bytes]`.
     pub(crate) fn has_starred_annotation(&self) -> bool {
         matches!(self.annotation_kind, ParameterAnnotationKind::Starred)
+    }
+
+    /// Return `true` if this parameter was declared as `**kwargs: Unpack[K]` for a type variable
+    /// `K` bounded by a `TypedDict` (PEP 827).
+    pub(crate) fn is_unpacked_typevar_kwargs(&self) -> bool {
+        matches!(
+            self.annotation_kind,
+            ParameterAnnotationKind::UnpackedTypeVarKwargs
+        )
     }
 
     /// Kind of the parameter.

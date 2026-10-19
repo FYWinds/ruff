@@ -11,10 +11,18 @@
 //! Phase 4: string operators (`Uppercase`, `Lowercase`, `Capitalize`, `Uncapitalize`, `Concat`,
 //! and `Slice` over strings); see [`super::string_ops`].
 //!
-//! Operators are evaluated eagerly whenever their operands are fully known. Only operators whose
-//! operands still contain unsolved type variables (or other unresolved operators) are stored as
-//! [`Type::TypeOperator`]; they are re-evaluated whenever a type mapping (e.g. a specialization)
-//! is applied to them.
+//! Phase 5: `Annotated` metadata of class attributes (`GetAnnotations`, `DropAnnotations`).
+//!
+//! Operators are evaluated eagerly whenever their operands are fully known. Only two kinds of
+//! operators exist as [`Type::TypeOperator`]:
+//!
+//! - unresolved operators, whose operands still contain unsolved type variables (or other
+//!   unresolved operators); they are re-evaluated whenever a type mapping (e.g. a
+//!   specialization) is applied to them;
+//! - inert operators ([`TypeOperatorKind::is_inert`]), which are fully evaluated values that only
+//!   exist in this form because they carry information that ordinary types cannot express
+//!   (`Annotated` metadata in the type argument of a `Member`). Code that treats an operator as
+//!   "not known yet" must check [`TypeOperatorKind::is_inert`] first.
 //!
 //! [PEP 827]: https://peps.python.org/pep-0827/
 
@@ -24,14 +32,16 @@ use ruff_python_ast::name::Name;
 
 use super::callable::walk_callable_type;
 use super::function::{FunctionType, walk_function_type};
+use super::generic_callable;
 use super::generics::walk_specialization_types;
 
+use super::extended_callable::{self, param_args};
 use super::literal::MAX_STRING_LITERAL_SIZE;
 use super::member_introspection::string_literal_type;
 use super::member_introspection::{
     all_qualifiers_type, find_member, member_args, member_instance, members_of, parse_qualifiers,
 };
-use super::signatures::CallableSignature;
+use super::signatures::{CallableSignature, Parameters, Signature};
 use super::string_ops::{StringCaseOp, StringOperand};
 use super::tuple::{Tuple, TupleSpec, TupleSpecBuilder, TupleType, VariableSegment};
 use super::type_alias::alias_has_type_operator;
@@ -62,7 +72,8 @@ pub struct TypeOperatorType<'db> {
 // The Salsa heap is tracked separately.
 impl get_size2::GetSize for TypeOperatorType<'_> {}
 
-/// A field of a `Member` that can be accessed with dot syntax in a type expression (`m.name`).
+/// A component of a `Member` or `Param` that can be accessed with dot syntax in a type expression
+/// (`m.name`, `p.kind`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, get_size2::GetSize, salsa::SalsaValue)]
 pub enum MemberField {
     Name,
@@ -70,17 +81,31 @@ pub enum MemberField {
     Quals,
     Init,
     Definer,
+    Kind,
+    Default,
 }
 
 impl MemberField {
-    /// The index of the corresponding type parameter of `Member`.
-    const fn index(self) -> usize {
+    /// The index of the corresponding type parameter of `Member`, if `Member` has this component.
+    pub(crate) const fn member_index(self) -> Option<usize> {
         match self {
-            Self::Name => 0,
-            Self::Type => 1,
-            Self::Quals => 2,
-            Self::Init => 3,
-            Self::Definer => 4,
+            Self::Name => Some(0),
+            Self::Type => Some(1),
+            Self::Quals => Some(2),
+            Self::Init => Some(3),
+            Self::Definer => Some(4),
+            Self::Kind | Self::Default => None,
+        }
+    }
+
+    /// The index of the corresponding type parameter of `Param`, if `Param` has this component.
+    pub(crate) const fn param_index(self) -> Option<usize> {
+        match self {
+            Self::Name => Some(0),
+            Self::Type => Some(1),
+            Self::Kind => Some(2),
+            Self::Default => Some(3),
+            Self::Quals | Self::Init | Self::Definer => None,
         }
     }
 
@@ -91,6 +116,8 @@ impl MemberField {
             Self::Quals => "quals",
             Self::Init => "init",
             Self::Definer => "definer",
+            Self::Kind => "kind",
+            Self::Default => "default",
         }
     }
 
@@ -101,6 +128,8 @@ impl MemberField {
             "quals" => Self::Quals,
             "init" => Self::Init,
             "definer" => Self::Definer,
+            "kind" => Self::Kind,
+            "default" => Self::Default,
             _ => return None,
         })
     }
@@ -129,6 +158,40 @@ impl<'db> VariadicArg<'db> {
             Self::Single(_) => Self::Single(ty),
             Self::Unpacked(_) => Self::Unpacked(ty),
         }
+    }
+}
+
+/// The argument of `GetAnnotations` / `DropAnnotations` that can carry `Annotated` metadata
+/// (recognized syntactically, see `infer_annotation_operator_type_expression`). It is stored
+/// instead of the evaluated argument, because reading `m.type` strips the metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, get_size2::GetSize, salsa::SalsaValue)]
+pub enum AnnotationSource<'db> {
+    /// `X.type`, where `X` describes a `Member` (a type variable, a comprehension variable,
+    /// `GetMember[...]`, ...).
+    MemberType(Type<'db>),
+    /// `GetMemberType[T, S]`.
+    GetMemberType(Type<'db>, Type<'db>),
+}
+
+impl<'db> AnnotationSource<'db> {
+    fn for_each_operand(self, mut f: impl FnMut(Type<'db>)) {
+        match self {
+            Self::MemberType(member) => f(member),
+            Self::GetMemberType(ty, name) => {
+                f(ty);
+                f(name);
+            }
+        }
+    }
+
+    fn try_map(self, mut f: impl FnMut(Type<'db>) -> Option<Type<'db>>) -> Option<Self> {
+        Some(match self {
+            Self::MemberType(member) => Self::MemberType(f(member)?),
+            Self::GetMemberType(ty, name) => {
+                let [ty, name] = [ty, name].map(&mut f);
+                Self::GetMemberType(ty?, name?)
+            }
+        })
     }
 }
 
@@ -208,6 +271,35 @@ pub enum TypeOperatorKind<'db> {
     /// evaluated as an unpacked comprehension: a tuple of type booleans, or an unresolved
     /// `UnpackMap`.
     Quantifier { all: bool, elements: Type<'db> },
+    /// `Callable[Params[*params], return_ty]` whose parameter list is not known yet (an element
+    /// or an unpacked sequence of `Params` depends on unsolved type variables). Once evaluated,
+    /// it is an ordinary callable type (see [`super::extended_callable`]).
+    ExtendedCallable {
+        params: Box<[VariadicArg<'db>]>,
+        return_ty: Type<'db>,
+    },
+    /// `Overloaded[...]` with arguments that are not known yet.
+    OverloadedOf(Box<[VariadicArg<'db>]>),
+    /// `GetAnnotations[X]`, where `X` is one of the forms of [`AnnotationSource`].
+    GetAnnotations(AnnotationSource<'db>),
+    /// `DropAnnotations[X]`, where `X` is one of the forms of [`AnnotationSource`].
+    DropAnnotations(AnnotationSource<'db>),
+    /// Inert (see [`TypeOperatorKind::is_inert`]): the type `inner` of a class attribute declared
+    /// as `Annotated[inner, *metadata]`. Only exists as the `T` argument of a `Member` collected
+    /// by `Attrs` / `Members` / `GetMember`; every other way of reading that argument strips it
+    /// (see [`strip_annotated`]). Displayed, compared and bounded as `inner`.
+    Annotated {
+        inner: Type<'db>,
+        metadata: Box<[Type<'db>]>,
+    },
+    /// `GenericCallable[Vs, lambda <binders>: body]` whose body is an unresolved operator that
+    /// depends on outer type variables. Once the body evaluates to a callable, the result is that
+    /// callable with `binders` as its own type parameters. A type mapping never substitutes the
+    /// binders (they are local to the lambda).
+    GenericCallable {
+        binders: Box<[BoundTypeVarInstance<'db>]>,
+        body: Type<'db>,
+    },
 }
 
 /// How an operand contributes to the result of an operator.
@@ -297,6 +389,19 @@ impl<'db> TypeOperatorKind<'db> {
             Self::NewProtocol(args) | Self::NewTypedDict(args) => {
                 args.iter().for_each(|arg| f(arg.ty(), Input));
             }
+            Self::ExtendedCallable { params, return_ty } => {
+                params.iter().for_each(|arg| f(arg.ty(), Input));
+                f(*return_ty, Output);
+            }
+            Self::OverloadedOf(args) => args.iter().for_each(|arg| f(arg.ty(), Input)),
+            Self::GetAnnotations(source) | Self::DropAnnotations(source) => {
+                source.for_each_operand(|ty| f(ty, Input));
+            }
+            Self::Annotated { inner, metadata } => {
+                f(*inner, Output);
+                metadata.iter().for_each(|ty| f(*ty, Input));
+            }
+            Self::GenericCallable { body, .. } => f(*body, Output),
         }
     }
 
@@ -402,7 +507,43 @@ impl<'db> TypeOperatorKind<'db> {
                 all: *all,
                 elements: f(*elements, Input)?,
             },
+            Self::ExtendedCallable { params, return_ty } => {
+                let params = Self::map_args(params, |ty| f(ty, Input));
+                let return_ty = f(*return_ty, Output);
+                Self::ExtendedCallable {
+                    params: params?,
+                    return_ty: return_ty?,
+                }
+            }
+            Self::OverloadedOf(args) => {
+                Self::OverloadedOf(Self::map_args(args, |ty| f(ty, Input))?)
+            }
+            Self::GetAnnotations(source) => {
+                Self::GetAnnotations(source.try_map(|ty| f(ty, Input))?)
+            }
+            Self::DropAnnotations(source) => {
+                Self::DropAnnotations(source.try_map(|ty| f(ty, Input))?)
+            }
+            Self::Annotated { inner, metadata } => Self::Annotated {
+                inner: f(*inner, Output)?,
+                metadata: metadata
+                    .iter()
+                    .map(|ty| f(*ty, Input))
+                    .collect::<Option<_>>()?,
+            },
+            Self::GenericCallable { binders, body } => Self::GenericCallable {
+                binders: binders.clone(),
+                body: f(*body, Output)?,
+            },
         })
+    }
+
+    /// Returns `true` for an inert operator: a fully evaluated value that is only represented as
+    /// a [`Type::TypeOperator`] because it carries information that ordinary types cannot
+    /// express. Such an operator never needs deferral, is not a type boolean and cannot be
+    /// unpacked; its operands are visited transparently.
+    pub(crate) const fn is_inert(&self) -> bool {
+        matches!(self, Self::Annotated { .. })
     }
 
     fn map_args(
@@ -423,7 +564,7 @@ pub(crate) struct TypeOperatorError {
 }
 
 impl TypeOperatorError {
-    fn new(message: impl Into<String>) -> Self {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
         }
@@ -491,7 +632,7 @@ pub(crate) fn is_unresolved_alias<'db>(
 }
 
 /// Returns the raised error marker if `ty` (after resolving type aliases) is one.
-fn as_raised_error<'db>(db: &'db dyn Db, ty: Type<'db>) -> Option<Type<'db>> {
+pub(super) fn as_raised_error<'db>(db: &'db dyn Db, ty: Type<'db>) -> Option<Type<'db>> {
     match ty.resolve_type_alias(db) {
         raised @ Type::Dynamic(DynamicType::RaisedError(_)) => Some(raised),
         _ => None,
@@ -528,6 +669,7 @@ impl<'db> TypeBoolValue<'db> {
             }
             Type::Dynamic(DynamicType::RaisedError(_)) => Self::Raised(resolved),
             Type::Dynamic(_) => Self::Dynamic(resolved),
+            Type::TypeOperator(operator) if operator.kind(db).is_inert() => Self::NotABool,
             // An unresolved operator. (An unresolved conditional type may still evaluate to a
             // type boolean once its condition is known.)
             Type::TypeOperator(_) => Self::Deferred,
@@ -553,7 +695,7 @@ pub(crate) fn is_type_bool_operand<'db>(
             } => {
                 is_type_bool_operand(db, env, *if_true) && is_type_bool_operand(db, env, *if_false)
             }
-            _ => true,
+            kind => !kind.is_inert(),
         },
         // Cycle markers can stand in for any type during fixed-point iteration.
         Type::Divergent(_) | Type::Recursive(_) => true,
@@ -570,7 +712,11 @@ pub(crate) fn is_type_bool_operand<'db>(
 /// Type variables bound by the generic context of a callable signature within `ty` (e.g. the
 /// type parameter `U` of a method `def f[U](self, x: U) -> U` that appears as a member type) are
 /// not free.
-fn needs_deferral<'db>(db: &'db dyn Db, env: &ProgramEnvironment<'db>, ty: Type<'db>) -> bool {
+pub(super) fn needs_deferral<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    ty: Type<'db>,
+) -> bool {
     let visitor = FreeTypeVarVisitor {
         env,
         bound: RefCell::default(),
@@ -634,6 +780,14 @@ impl<'db> visitor::TypeVisitor<'db> for FreeTypeVarVisitor<'db, '_> {
                 if !self.bound.borrow().contains(&identity) {
                     self.found.set(true);
                 }
+            }
+            // An inert operator is a value: only its operands can be free. Inside a callable
+            // signature that binds type variables, an unresolved operator is walked, too: it is
+            // free only if its operands refer to type variables that the signature does not bind.
+            Type::TypeOperator(operator)
+                if operator.kind(db).is_inert() || !self.bound.borrow().is_empty() =>
+            {
+                walk_type_operator_type(db, operator, self);
             }
             Type::Divergent(_) | Type::Recursive(_) | Type::TypeOperator(_) => {
                 self.found.set(true);
@@ -814,6 +968,9 @@ pub(crate) fn find_raised_errors<'db>(
                         found.push(raised);
                     }
                 }
+                Type::TypeOperator(operator) if operator.kind(db).is_inert() => {
+                    walk_type_operator_type(db, operator, self);
+                }
                 Type::TypeOperator(_) => {}
                 Type::TypeAlias(alias) => {
                     if self.seen_aliases.borrow().contains(&alias) {
@@ -855,25 +1012,106 @@ pub(crate) fn comprehension_binder<'db>(
     BoundTypeVarInstance::synthetic(db, env, name, TypeVarVariance::Invariant)
 }
 
-/// Accesses a field of a `Member` in a type expression (`m.name`).
+/// Removes the inert `Annotated` wrapper ([`TypeOperatorKind::Annotated`]) that a `Member`'s
+/// type argument may carry. Every path that reads that argument into an ordinary type (dot
+/// access, `GetMemberType`, structural synthesis, `Params`, ...) must call this.
+pub(crate) fn strip_annotated<'db>(db: &'db dyn Db, ty: Type<'db>) -> Type<'db> {
+    match ty {
+        Type::TypeOperator(operator) => match operator.kind(db) {
+            TypeOperatorKind::Annotated { inner, .. } => *inner,
+            _ => ty,
+        },
+        _ => ty,
+    }
+}
+
+/// How the raw type argument `T` of a `Member` is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MemberTypeRead {
+    /// The type without `Annotated` metadata (`GetMemberType`, `DropAnnotations`).
+    Plain,
+    /// The union of the `Annotated` metadata, or `Never` without metadata (`GetAnnotations`).
+    Annotations,
+}
+
+impl MemberTypeRead {
+    fn apply<'db>(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        raw: Type<'db>,
+    ) -> Type<'db> {
+        match self {
+            Self::Plain => strip_annotated(db, raw),
+            Self::Annotations => match raw {
+                Type::TypeOperator(operator) => match operator.kind(db) {
+                    TypeOperatorKind::Annotated { metadata, .. } => {
+                        UnionType::from_elements(db, env, metadata.iter().copied())
+                    }
+                    _ => Type::Never,
+                },
+                _ => Type::Never,
+            },
+        }
+    }
+}
+
+/// Why a dot access in a type expression (`m.name`, `p.kind`) failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MemberAccessError {
+    /// The left-hand side is not a `Member` or `Param` type (including unions of them).
+    NotMemberOrParam,
+    /// The left-hand side is a `Member` (`class_name == "Member"`) or `Param`, which does not
+    /// have the accessed component.
+    NotAComponent { class_name: &'static str },
+}
+
+impl MemberAccessError {
+    /// The message for a component that the class does not have.
+    pub(crate) fn not_a_component_message(field: MemberField, class_name: &str) -> String {
+        let expected = if class_name == "Param" {
+            "`name`, `type`, `kind` or `default`"
+        } else {
+            "`name`, `type`, `quals`, `init` or `definer`"
+        };
+        format!(
+            "`.{}` is not a component of `{class_name}`; expected one of {expected}",
+            field.as_str()
+        )
+    }
+}
+
+/// Accesses a component of a `Member` or `Param` in a type expression (`m.name`, `p.kind`).
 ///
-/// Returns the corresponding specialization argument of a `Member`, an unresolved
+/// Returns the corresponding specialization argument of a `Member` or `Param`, an unresolved
 /// [`TypeOperatorKind::MemberAccess`] if `ty` contains type variables (such as a comprehension
-/// binder), `ty` itself for `Any`/`Unknown`, and `Never` for `Never`. Returns `Err` if `ty` is not
-/// a `Member` (including unions of `Member`s).
+/// binder), `ty` itself for `Any`/`Unknown`, and `Never` for `Never`. Each class only has its own
+/// components (P5-31).
 pub(crate) fn member_access<'db>(
     db: &'db dyn Db,
     env: &ProgramEnvironment<'db>,
     ty: Type<'db>,
     field: MemberField,
-) -> Result<Type<'db>, ()> {
+) -> Result<Type<'db>, MemberAccessError> {
     let resolved = ty.resolve_type_alias(db);
     match resolved {
         Type::Dynamic(_) | Type::Never => return Ok(resolved),
         _ => {}
     }
     if let Some(args) = member_args(db, env, resolved) {
-        return Ok(args[field.index()]);
+        return field
+            .member_index()
+            .map(|index| strip_annotated(db, args[index]))
+            .ok_or(MemberAccessError::NotAComponent {
+                class_name: "Member",
+            });
+    }
+    if let Some(args) = param_args(db, env, resolved) {
+        return field.param_index().map(|index| args[index]).ok_or(
+            MemberAccessError::NotAComponent {
+                class_name: "Param",
+            },
+        );
     }
     if needs_deferral(db, env, resolved) {
         return Ok(Type::TypeOperator(TypeOperatorType::new(
@@ -881,7 +1119,7 @@ pub(crate) fn member_access<'db>(
             TypeOperatorKind::MemberAccess(ty, field),
         )));
     }
-    Err(())
+    Err(MemberAccessError::NotMemberOrParam)
 }
 
 /// Determines the elements of `ty` when it is unpacked in a variadic position or iterated over in
@@ -1166,49 +1404,11 @@ impl<'db> TypeOperatorType<'db> {
                     })
                 })
             }
-            TypeOperatorKind::GetMember(ty, name) | TypeOperatorKind::GetMemberType(ty, name) => {
-                if needs_deferral(db, env, *ty) || needs_deferral(db, env, *name) {
-                    return defer(kind);
-                }
-                let get_member = matches!(kind, TypeOperatorKind::GetMember(..));
-                let operator_name = if get_member {
-                    "GetMember"
-                } else {
-                    "GetMemberType"
-                };
-                lift_over_unions(db, env, &[*ty, *name], |args| {
-                    let [ty, name] = [args[0], args[1]];
-                    if ty.is_dynamic() {
-                        return Ok(ty);
-                    }
-                    if name.is_dynamic() {
-                        return Ok(name);
-                    }
-                    let Some(name_literal) = name.as_string_literal() else {
-                        return Err(TypeOperatorError::new(format!(
-                            "The second argument to `{operator_name}` must be a string literal \
-                             type, but got `{}`",
-                            name.display(db, env)
-                        )));
-                    };
-                    let members = members_of(db, env, ty, false).ok_or_else(|| {
-                        TypeOperatorError::new(format!(
-                            "`{operator_name}` requires a class type, but got `{}`",
-                            ty.display(db, env)
-                        ))
-                    })?;
-                    let member_name = name_literal.value(db);
-                    match find_member(db, env, members, member_name) {
-                        Some(member) if get_member => Ok(member),
-                        Some(member) => Ok(member_args(db, env, member)
-                            .map_or_else(Type::unknown, |args| args[MemberField::Type.index()])),
-                        None if get_member => Err(TypeOperatorError::new(format!(
-                            "`{}` has no member named `{member_name}`",
-                            ty.display(db, env)
-                        ))),
-                        None => Ok(Type::Never),
-                    }
-                })
+            TypeOperatorKind::GetMember(ty, name) => {
+                Self::evaluate_get_member(db, env, &kind, *ty, *name, None)
+            }
+            TypeOperatorKind::GetMemberType(ty, name) => {
+                Self::evaluate_get_member(db, env, &kind, *ty, *name, Some(MemberTypeRead::Plain))
             }
             TypeOperatorKind::FromUnion(ty) => {
                 if needs_deferral(db, env, *ty) {
@@ -1221,12 +1421,15 @@ impl<'db> TypeOperatorType<'db> {
                 ))
             }
             TypeOperatorKind::MemberAccess(ty, field) => member_access(db, env, *ty, *field)
-                .map_err(|()| {
-                    TypeOperatorError::new(format!(
-                        "Cannot access `.{}` on `{}`: expected a `Member` type",
+                .map_err(|error| match error {
+                    MemberAccessError::NotMemberOrParam => TypeOperatorError::new(format!(
+                        "Cannot access `.{}` on `{}`: expected a `Member` or `Param` type",
                         field.as_str(),
                         ty.display(db, env)
-                    ))
+                    )),
+                    MemberAccessError::NotAComponent { class_name } => TypeOperatorError::new(
+                        MemberAccessError::not_a_component_message(*field, class_name),
+                    ),
                 }),
             TypeOperatorKind::UnpackMap {
                 iterable,
@@ -1349,7 +1552,108 @@ impl<'db> TypeOperatorType<'db> {
                 Ok(evaluate_connective(db, env, &elements, short_circuit)
                     .unwrap_or_else(|| Type::TypeOperator(TypeOperatorType::new(db, kind.clone()))))
             }
+            TypeOperatorKind::ExtendedCallable { params, return_ty } => Ok(
+                extended_callable::evaluate_extended_callable(db, env, params, *return_ty)?
+                    .unwrap_or_else(|| Type::TypeOperator(TypeOperatorType::new(db, kind.clone()))),
+            ),
+            TypeOperatorKind::OverloadedOf(args) => {
+                Ok(extended_callable::evaluate_overloaded(db, env, args)?
+                    .unwrap_or_else(|| Type::TypeOperator(TypeOperatorType::new(db, kind.clone()))))
+            }
+            TypeOperatorKind::GetAnnotations(source)
+            | TypeOperatorKind::DropAnnotations(source) => {
+                let source = *source;
+                let read = if matches!(kind, TypeOperatorKind::GetAnnotations(_)) {
+                    MemberTypeRead::Annotations
+                } else {
+                    MemberTypeRead::Plain
+                };
+                match source {
+                    AnnotationSource::MemberType(member) => {
+                        let resolved = member.resolve_type_alias(db);
+                        if resolved.is_dynamic() {
+                            return Ok(resolved);
+                        }
+                        // Read the raw type argument: `member_access` strips the metadata.
+                        if let Some([_, raw, ..]) = member_args(db, env, resolved) {
+                            return Ok(read.apply(db, env, raw));
+                        }
+                        match member_access(db, env, member, MemberField::Type) {
+                            Ok(Type::TypeOperator(_)) => defer(kind),
+                            Ok(ty) => Ok(read.apply(db, env, ty)),
+                            Err(_) => Err(TypeOperatorError::new(format!(
+                                "Cannot access `.type` on `{}`: expected a `Member` or `Param` \
+                                 type",
+                                member.display(db, env)
+                            ))),
+                        }
+                    }
+                    AnnotationSource::GetMemberType(ty, name) => {
+                        Self::evaluate_get_member(db, env, &kind, ty, name, Some(read))
+                    }
+                }
+            }
+            // Inert: kept as it is (with its operands mapped).
+            TypeOperatorKind::Annotated { .. } => defer(kind),
+            TypeOperatorKind::GenericCallable { binders, body } => Ok(
+                generic_callable::evaluate_generic_callable(db, env, binders, *body)?
+                    .unwrap_or_else(|| Type::TypeOperator(TypeOperatorType::new(db, kind.clone()))),
+            ),
         }
+    }
+
+    /// Evaluates `GetMember[ty, name]` (`read == None`), or reads the type of that member
+    /// (`GetMemberType[ty, name]`, or the argument of `GetAnnotations` / `DropAnnotations`)
+    /// as described by `read`. Lifted over unions.
+    fn evaluate_get_member(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        kind: &TypeOperatorKind<'db>,
+        ty: Type<'db>,
+        name: Type<'db>,
+        read: Option<MemberTypeRead>,
+    ) -> OperatorResult<'db> {
+        if needs_deferral(db, env, ty) || needs_deferral(db, env, name) {
+            return Ok(Type::TypeOperator(TypeOperatorType::new(db, kind.clone())));
+        }
+        let operator_name = if read.is_none() {
+            "GetMember"
+        } else {
+            "GetMemberType"
+        };
+        lift_over_unions(db, env, &[ty, name], |args| {
+            let [ty, name] = [args[0], args[1]];
+            if ty.is_dynamic() {
+                return Ok(ty);
+            }
+            if name.is_dynamic() {
+                return Ok(name);
+            }
+            let Some(name_literal) = name.as_string_literal() else {
+                return Err(TypeOperatorError::new(format!(
+                    "The second argument to `{operator_name}` must be a string literal type, but \
+                     got `{}`",
+                    name.display(db, env)
+                )));
+            };
+            let members = members_of(db, env, ty, false).ok_or_else(|| {
+                TypeOperatorError::new(format!(
+                    "`{operator_name}` requires a class type, but got `{}`",
+                    ty.display(db, env)
+                ))
+            })?;
+            let member_name = name_literal.value(db);
+            match (find_member(db, env, members, member_name), read) {
+                (Some(member), None) => Ok(member),
+                (Some(member), Some(read)) => Ok(member_args(db, env, member)
+                    .map_or_else(Type::unknown, |[_, raw, ..]| read.apply(db, env, raw))),
+                (None, None) => Err(TypeOperatorError::new(format!(
+                    "`{}` has no member named `{member_name}`",
+                    ty.display(db, env)
+                ))),
+                (None, Some(_)) => Ok(Type::Never),
+            }
+        })
     }
 
     /// Evaluates an operator whose arguments are all lifted over unions (PEP 827 "Basic
@@ -1745,7 +2049,7 @@ impl<'db> TypeOperatorType<'db> {
             };
             members.push(SynthesisMember {
                 name: Name::new(name.value(db)),
-                ty,
+                ty: strip_annotated(db, ty),
                 qualifiers,
             });
         }
@@ -1784,8 +2088,39 @@ impl<'db> TypeOperatorType<'db> {
                 KnownClass::Str.to_instance(db, env),
             ),
             TypeOperatorKind::GetMember(..) => member_instance(db, env, [Type::any(); 5]),
-            TypeOperatorKind::MemberAccess(_, MemberField::Name)
-            | TypeOperatorKind::GetSpecialAttr(..)
+            TypeOperatorKind::MemberAccess(left, MemberField::Name) => {
+                // A `Param` may be unnamed. The left-hand side of an unresolved access is usually a
+                // comprehension binder without a bound; it is treated as a `Member` (whose name
+                // is a `str`) so that `Member[p.name, ...]` satisfies the bound of `Member`.
+                let left_bound = match left.resolve_type_alias(db) {
+                    Type::TypeOperator(operator) => operator.upper_bound(db, env),
+                    Type::TypeVar(typevar) => typevar
+                        .typevar(db)
+                        .upper_bound(db, env)
+                        .unwrap_or_else(Type::object),
+                    left => left,
+                };
+                if param_args(db, env, left_bound).is_none() {
+                    KnownClass::Str.to_instance(db, env)
+                } else {
+                    UnionType::from_two_elements(
+                        db,
+                        env,
+                        KnownClass::Str.to_instance(db, env),
+                        Type::none(db, env),
+                    )
+                }
+            }
+            TypeOperatorKind::MemberAccess(_, MemberField::Kind) => {
+                KnownClass::TyExtensionsParamKind.to_instance(db, env)
+            }
+            TypeOperatorKind::ExtendedCallable { .. }
+            | TypeOperatorKind::OverloadedOf(_)
+            | TypeOperatorKind::GenericCallable { .. } => Type::single_callable(
+                db,
+                Signature::new(Parameters::gradual_form(), Type::object()),
+            ),
+            TypeOperatorKind::GetSpecialAttr(..)
             | TypeOperatorKind::StringCase(..)
             | TypeOperatorKind::Concat(..) => KnownClass::Str.to_instance(db, env),
             TypeOperatorKind::MemberAccess(_, MemberField::Quals) => all_qualifiers_type(db, env),
@@ -1797,12 +2132,15 @@ impl<'db> TypeOperatorType<'db> {
             ),
             // Once evaluated, `RaiseError` is a dynamic type.
             TypeOperatorKind::RaiseError { .. } => Type::unknown(),
+            TypeOperatorKind::Annotated { inner, .. } => *inner,
             TypeOperatorKind::MemberAccess(..)
             | TypeOperatorKind::GetMemberType(..)
             | TypeOperatorKind::UnionOf(_)
             | TypeOperatorKind::NewProtocol(_)
             | TypeOperatorKind::NewTypedDict(_)
-            | TypeOperatorKind::GetArg(..) => Type::object(),
+            | TypeOperatorKind::GetArg(..)
+            | TypeOperatorKind::GetAnnotations(_)
+            | TypeOperatorKind::DropAnnotations(_) => Type::object(),
         }
     }
 
@@ -1816,6 +2154,7 @@ impl<'db> TypeOperatorType<'db> {
             } => IntersectionType::from_two_elements(db, env, *if_true, *if_false),
             // Once evaluated, `RaiseError` is a dynamic type.
             TypeOperatorKind::RaiseError { .. } => Type::unknown(),
+            TypeOperatorKind::Annotated { inner, .. } => *inner,
             _ => Type::Never,
         }
     }
@@ -1828,7 +2167,8 @@ impl<'db> TypeOperatorType<'db> {
     ///
     /// A mapping never substitutes the binder of an unpacked comprehension in that
     /// comprehension's body or conditions (the binder shadows any outer binder with the same
-    /// identity); the iterable is still mapped.
+    /// identity); the iterable is still mapped. Likewise, a generic callable whose binders a
+    /// mapping would substitute is kept unchanged.
     pub(super) fn apply_type_mapping_impl<'a>(
         self,
         db: &'db dyn Db,
@@ -1919,6 +2259,20 @@ impl<'db> TypeOperatorType<'db> {
                         TypeOperatorKind::And(mapped.into_boxed_slice())
                     }
                 }
+                // The binders of a generic callable are local to it, like the binder of an
+                // unpacked comprehension.
+                TypeOperatorKind::GenericCallable { binders, .. }
+                    if binders.iter().any(|binder| {
+                        Type::TypeVar(*binder).apply_type_mapping_impl(
+                            db,
+                            type_mapping,
+                            TypeContext::default(),
+                            visitor,
+                        ) != Type::TypeVar(*binder)
+                    }) =>
+                {
+                    return Type::TypeOperator(self);
+                }
                 kind => kind
                     .try_map(|ty, role| Some(map(ty, role)))
                     .expect("infallible mapping"),
@@ -1930,11 +2284,15 @@ impl<'db> TypeOperatorType<'db> {
                 TypeOperatorKind::TupleOf(before)
                 | TypeOperatorKind::UnionOf(before)
                 | TypeOperatorKind::NewProtocol(before)
-                | TypeOperatorKind::NewTypedDict(before),
+                | TypeOperatorKind::NewTypedDict(before)
+                | TypeOperatorKind::OverloadedOf(before)
+                | TypeOperatorKind::ExtendedCallable { params: before, .. },
                 TypeOperatorKind::TupleOf(after)
                 | TypeOperatorKind::UnionOf(after)
                 | TypeOperatorKind::NewProtocol(after)
-                | TypeOperatorKind::NewTypedDict(after),
+                | TypeOperatorKind::NewTypedDict(after)
+                | TypeOperatorKind::OverloadedOf(after)
+                | TypeOperatorKind::ExtendedCallable { params: after, .. },
             ) = (self.kind(db), &kind)
                 && before.iter().zip(after.iter()).any(|(before, after)| {
                     matches!(before, VariadicArg::Unpacked(Type::TypeOperator(_)))
@@ -1985,7 +2343,7 @@ impl<'db> VarianceInferable<'db> for TypeOperatorType<'db> {
     // the argument of `Attrs`) can change the result arbitrarily, so such occurrences are
     // invariant. Operands that become part of the result (the branches of a conditional type,
     // the elements of `tuple[...]`, the body of a comprehension) are covariant. The binder of a
-    // comprehension is local to it.
+    // comprehension (and the binders of a generic callable) are local to it.
     fn variance_of(
         self,
         db: &'db dyn Db,
@@ -1995,6 +2353,11 @@ impl<'db> VarianceInferable<'db> for TypeOperatorType<'db> {
         let kind = self.kind(db);
         if let TypeOperatorKind::UnpackMap { binder, .. } = kind
             && binder.identity(db) == typevar
+        {
+            return VarianceTerm::BIVARIANT;
+        }
+        if let TypeOperatorKind::GenericCallable { binders, .. } = kind
+            && binders.iter().any(|binder| binder.identity(db) == typevar)
         {
             return VarianceTerm::BIVARIANT;
         }

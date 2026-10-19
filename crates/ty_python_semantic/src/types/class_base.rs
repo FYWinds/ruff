@@ -327,6 +327,11 @@ impl<'db> ClassBase<'db> {
                 | SpecialFormType::Concat
                 | SpecialFormType::GetSpecialAttr
                 | SpecialFormType::RaiseError
+                | SpecialFormType::Overloaded
+                | SpecialFormType::GenericCallable
+                | SpecialFormType::GetAnnotations
+                | SpecialFormType::DropAnnotations
+                | SpecialFormType::UpdateClass
                 | SpecialFormType::TypeOf
                 | SpecialFormType::CallableTypeOf
                 | SpecialFormType::RegularCallableTypeOf

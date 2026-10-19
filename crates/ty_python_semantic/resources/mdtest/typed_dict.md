@@ -5468,7 +5468,7 @@ accepts_optional_kwargs(a="bad")
 
 These signatures should be rejected. Some of them use a well-formed `Unpack[...]` expression, but
 the overall `**kwargs` signature is still invalid: mixing explicit parameters with conflicting
-unpacked names, using a type variable, or using a union instead of a concrete `TypedDict`.
+unpacked names, or using a union instead of a concrete `TypedDict`.
 
 ```py
 from typing import TypeVar, Union
@@ -5489,7 +5489,8 @@ def func5(v1: int, **kwargs: Unpack[TD1]) -> None:  # error: [invalid-type-form]
 
 T = TypeVar("T", bound=TD1)
 
-def func6(**kwargs: Unpack[T]) -> None:  # error: [invalid-type-form]
+# A type variable bounded by a `TypedDict` is accepted (PEP 827).
+def func6(**kwargs: Unpack[T]) -> None:
     pass
 
 TDUnion = Union[TD1, TD2]

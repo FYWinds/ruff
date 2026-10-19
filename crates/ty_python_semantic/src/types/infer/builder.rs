@@ -61,6 +61,7 @@ use crate::types::callable::CallableTypeKind;
 use crate::types::class::{
     ClassLiteral, CodeGeneratorKind, FrozenDataclassDispatch, MethodDecorator,
 };
+use crate::types::class_base::ClassBase;
 use crate::types::constraints::{CandidateSolutions, ConstraintSetBuilder, Solutions};
 use crate::types::context::InferContext;
 use crate::types::dedicated::pydantic;
@@ -172,6 +173,7 @@ mod dynamic_class;
 mod enum_call;
 mod final_attribute;
 mod function;
+mod generic_callable;
 mod imports;
 mod named_tuple;
 mod new_class;
@@ -216,6 +218,23 @@ fn should_preserve_inferred_binding_type(ty: Type<'_>) -> bool {
     // Dataclass field specifiers carry metadata in the inferred RHS type; replacing it with the
     // declared field type would lose settings like `init=False`.
     matches!(ty, Type::KnownInstance(KnownInstanceType::Field(_)))
+}
+
+/// Returns `true` if `ty` is an instance of `ty_extensions.InitField` or one of its subclasses.
+fn is_init_field_instance<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    ty: Type<'db>,
+) -> bool {
+    let Type::NominalInstance(instance) = ty else {
+        return false;
+    };
+    instance
+        .class(db, env)
+        .class_literal(db)
+        .iter_mro(db)
+        .filter_map(ClassBase::into_class)
+        .any(|base| base.is_known(db, KnownClass::TyExtensionsInitField))
 }
 
 /// We currently store one dataclass field-specifiers inline, because that covers standard
@@ -1918,8 +1937,21 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     }
                 }
                 let declared_type = declared_ty.inner_type();
-                if self.validate_assignment_type(node, definition, None, declared_type, inferred_ty)
+                // PEP 827: a field descriptor (`ty_extensions.InitField`) can be assigned to a
+                // class-body attribute of any declared type. The binding keeps the descriptor so
+                // that the attribute's `Member` records it as `Init`; instances still see the
+                // declared type.
+                if self.index.scope(file_scope_id).kind() == ScopeKind::Class
+                    && is_init_field_instance(db, env, inferred_ty)
                 {
+                    (declared_ty, inferred_ty)
+                } else if self.validate_assignment_type(
+                    node,
+                    definition,
+                    None,
+                    declared_type,
+                    inferred_ty,
+                ) {
                     // TODO We currently can't distinguish here between "no declared type" and
                     // "declared types is `Unknown` (e.g. due to a bad annotation, missing
                     // import, etc.)". Ideally we would still prefer `Unknown` declared type,

@@ -417,18 +417,12 @@ impl<'db> SemanticModel<'db> {
             ast::AnyNodeRef::StmtClassDef(class) => {
                 Some(class.definition(self).scope(self.db).file_scope_id(self.db))
             }
-            ast::AnyNodeRef::Parameter(parameter) => Some(
-                parameter
-                    .definition(self)
-                    .scope(self.db)
-                    .file_scope_id(self.db),
-            ),
-            ast::AnyNodeRef::ParameterWithDefault(parameter) => Some(
-                parameter
-                    .definition(self)
-                    .scope(self.db)
-                    .file_scope_id(self.db),
-            ),
+            ast::AnyNodeRef::Parameter(parameter) => parameter
+                .optional_definition(self)
+                .map(|definition| definition.scope(self.db).file_scope_id(self.db)),
+            ast::AnyNodeRef::ParameterWithDefault(parameter) => parameter
+                .optional_definition(self)
+                .map(|definition| definition.scope(self.db).file_scope_id(self.db)),
             ast::AnyNodeRef::ExceptHandlerExceptHandler(handler) => handler
                 .optional_definition(self)
                 .map(|definition| definition.scope(self.db).file_scope_id(self.db))
@@ -1021,7 +1015,7 @@ pub trait HasDefinition {
     fn definition<'db>(&self, model: &SemanticModel<'db>) -> Definition<'db>;
 }
 
-trait HasOptionalDefinition {
+pub trait HasOptionalDefinition {
     /// Returns the definition of `self`, if it has one.
     ///
     /// ## Panics
@@ -1150,10 +1144,44 @@ macro_rules! impl_binding_has_ty_def {
     };
 }
 
+/// Like `impl_binding_has_ty_def`, for parameters. The parameters of a lambda in a type expression
+/// (PEP 827 `GenericCallable[Vs, lambda <params>: <type>]`) have no definition, so their type is
+/// looked up through [`HasOptionalDefinition`].
+macro_rules! impl_parameter_has_ty_def {
+    ($ty: ty) => {
+        impl HasDefinition for $ty {
+            #[inline]
+            fn definition<'db>(&self, model: &SemanticModel<'db>) -> Definition<'db> {
+                let index = semantic_index(model.db, model.program_file());
+                index.expect_single_definition(self)
+            }
+        }
+
+        impl HasOptionalDefinition for $ty {
+            #[inline]
+            fn optional_definition<'db>(
+                &self,
+                model: &SemanticModel<'db>,
+            ) -> Option<Definition<'db>> {
+                let index = semantic_index(model.db, model.program_file());
+                index.try_definition(self)
+            }
+        }
+
+        impl HasType for $ty {
+            #[inline]
+            fn inferred_type<'db>(&self, model: &SemanticModel<'db>) -> Option<Type<'db>> {
+                let binding = self.optional_definition(model)?;
+                Some(binding_type(model.db(), binding))
+            }
+        }
+    };
+}
+
 impl_binding_has_ty_def!(ast::StmtFunctionDef);
 impl_binding_has_ty_def!(ast::StmtClassDef);
-impl_binding_has_ty_def!(ast::Parameter);
-impl_binding_has_ty_def!(ast::ParameterWithDefault);
+impl_parameter_has_ty_def!(ast::Parameter);
+impl_parameter_has_ty_def!(ast::ParameterWithDefault);
 impl_binding_has_ty_def!(ast::TypeParamTypeVar);
 impl_binding_has_ty_def!(ast::TypeParamParamSpec);
 impl_binding_has_ty_def!(ast::TypeParamTypeVarTuple);

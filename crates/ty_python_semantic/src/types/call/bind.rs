@@ -65,7 +65,9 @@ use crate::types::signatures::{
     PartialApplication, PartialSignatureApplication,
 };
 use crate::types::tuple::{TupleLength, TupleSpec, TupleSpecBuilder, TupleType, VariableSegment};
-use crate::types::typed_dict::TypedDictOpenness;
+use crate::types::typed_dict::{
+    TypedDictFieldBuilder, TypedDictOpenness, TypedDictSchema, TypedDictType,
+};
 use crate::types::typevar::{BoundTypeVarIdentity, TypeVarNonceGenerator, TypeVarSet};
 use crate::types::variance::VarianceInferable;
 use crate::types::visitor::{
@@ -5773,6 +5775,149 @@ fn validate_keyword_unpack_key_type<'db>(
     }
 }
 
+/// The keyword arguments of a call collected for a `**kwargs: Unpack[K]` parameter, where `K` is
+/// a type variable bounded by a `TypedDict` (PEP 827).
+///
+/// ```py
+/// def capture[K: BaseTypedDict](**kwargs: Unpack[K]) -> K: ...
+///
+/// capture(x=1, y="a")  # the argument for `**kwargs` is `TypedDict({x: Literal[1], y: Literal["a"]})`
+/// ```
+#[derive(Clone, Copy, Debug)]
+struct UnpackedTypeVarKwargsArgument<'db> {
+    parameter_index: usize,
+    /// The index of the first argument collected into the `TypedDict`, including synthetic
+    /// receivers.
+    argument_index: Option<usize>,
+    /// The source index of the first argument collected into the `TypedDict`, for diagnostics.
+    adjusted_argument_index: Option<usize>,
+    /// The synthesized `TypedDict`.
+    argument_type: Type<'db>,
+}
+
+impl<'db> UnpackedTypeVarKwargsArgument<'db> {
+    /// Returns the index of a `**kwargs: Unpack[K]` parameter in `parameters`, if any.
+    fn parameter_index(parameters: &Parameters<'db>) -> Option<usize> {
+        parameters
+            .keyword_variadic()
+            .filter(|(_, parameter)| parameter.is_unpacked_typevar_kwargs())
+            .map(|(index, _)| index)
+    }
+
+    /// Collects the keyword arguments matched to the `**kwargs: Unpack[K]` parameter into a
+    /// synthesized `TypedDict`.
+    ///
+    /// The items of the `TypedDict` that `K` is bounded by (or of `K` itself, once the signature
+    /// is specialized) decide the item types: an argument for a read-only item, or for a name that
+    /// is not an item, keeps its (literal) type and becomes read-only; an argument for a mutable
+    /// item gets the item's declared type. Items of the bound keep their flags, and a read-only,
+    /// not-required item without an argument has the type `Never`. Unpacked mappings whose keys
+    /// are not known do not contribute items.
+    fn collect(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        parameters: &Parameters<'db>,
+        arguments: &CallArguments<'_, 'db>,
+        argument_matches: &[MatchedArgument<'db>],
+    ) -> Option<Self> {
+        let parameter_index = Self::parameter_index(parameters)?;
+        let bound = match parameters[parameter_index].annotated_type() {
+            Type::TypeVar(typevar) => typevar.typevar(db).upper_bound(db, env),
+            annotated_type => Some(annotated_type),
+        }
+        .and_then(|bound| bound.resolve_type_alias(db).as_typed_dict());
+        let empty_schema = TypedDictSchema::default();
+        let bound_items = bound.map_or(&empty_schema, |bound| bound.items(db));
+
+        let mut first_argument_index = None;
+        let mut adjusted_argument_index = None;
+        let mut collected: Vec<(Name, Type<'db>, bool)> = Vec::new();
+        for (argument_index, adjusted_index, _, argument) in enumerate_argument_types(arguments) {
+            if !argument_matches[argument_index]
+                .iter()
+                .any(|matched| matched.index == parameter_index)
+            {
+                continue;
+            }
+            if first_argument_index.is_none() {
+                first_argument_index = Some(argument_index);
+                adjusted_argument_index = adjusted_index;
+            }
+            match argument {
+                CallArgument::Keyword { name, .. } => {
+                    collected.push((
+                        Name::new(*name),
+                        argument
+                            .matched_type(parameters[parameter_index].annotated_type(), None)
+                            .unwrap_or_else(Type::unknown),
+                        true,
+                    ));
+                }
+                CallArgument::Keywords(keywords) => {
+                    let Some(unpacked) = keywords.unpack(db, env) else {
+                        continue;
+                    };
+                    for (name, key) in &unpacked.keys {
+                        if parameters.keyword_by_name(name).is_none() {
+                            collected.push((name.clone(), key.value_ty, key.is_required));
+                        }
+                    }
+                }
+                CallArgument::Synthetic(_)
+                | CallArgument::Positional(_)
+                | CallArgument::Variadic(_) => {}
+            }
+        }
+
+        let mut schema = TypedDictSchema::default();
+        for (name, argument_ty, is_required) in collected {
+            let field = match bound_items.get(&name) {
+                Some(item) if !item.is_read_only() => {
+                    let declared_ty = item.declared_ty;
+                    let ty = if argument_ty.is_assignable_to(db, env, declared_ty) {
+                        declared_ty
+                    } else {
+                        argument_ty
+                    };
+                    TypedDictFieldBuilder::new(ty).required(item.is_required())
+                }
+                Some(item) => TypedDictFieldBuilder::new(argument_ty)
+                    .required(item.is_required())
+                    .read_only(true),
+                None => TypedDictFieldBuilder::new(argument_ty)
+                    .required(is_required)
+                    .read_only(true),
+            };
+            schema.insert(name, field.build());
+        }
+        // Iterate the underlying map: `&TypedDictSchema` iterates with a shorter field lifetime.
+        for (name, item) in &**bound_items {
+            if schema.contains_key(name) || item.is_required() {
+                continue;
+            }
+            let ty = if item.is_read_only() {
+                Type::Never
+            } else {
+                item.declared_ty
+            };
+            schema.insert(
+                name.clone(),
+                TypedDictFieldBuilder::new(ty)
+                    .required(false)
+                    .read_only(item.is_read_only())
+                    .build(),
+            );
+        }
+
+        Some(Self {
+            parameter_index,
+            argument_index: first_argument_index,
+            adjusted_argument_index,
+            argument_type: Type::TypedDict(TypedDictType::from_schema_items(db, schema)),
+        })
+    }
+}
+
 impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
     #[expect(clippy::too_many_arguments)]
     fn new(
@@ -5893,6 +6038,10 @@ impl<'a, 'db> CallInference<'a, 'db> {
     fn argument_relations(&self) -> impl Iterator<Item = ArgumentRelation<'db>> + 'a {
         let parameters: &'a Parameters<'db> = self.signature.parameters();
         let argument_matches: &'a [MatchedArgument<'db>] = self.argument_matches;
+        // The arguments of a `**kwargs: Unpack[K]` parameter are related to `K` together, see
+        // `unpacked_typevar_kwargs`.
+        let unpacked_typevar_kwargs_index =
+            UnpackedTypeVarKwargsArgument::parameter_index(parameters);
 
         enumerate_argument_types(self.arguments).flat_map(
             move |(argument_index, adjusted_argument_index, _, argument_types)| {
@@ -5903,7 +6052,8 @@ impl<'a, 'db> CallInference<'a, 'db> {
                         if ArgumentTypeChecker::is_gradual_variadic_parameter(
                             parameters,
                             parameter_index,
-                        ) {
+                        ) || unpacked_typevar_kwargs_index == Some(parameter_index)
+                        {
                             return None;
                         }
 
@@ -5923,6 +6073,18 @@ impl<'a, 'db> CallInference<'a, 'db> {
                         ))
                     })
             },
+        )
+    }
+
+    /// Collects the keyword arguments of a `**kwargs: Unpack[K]` parameter into one `TypedDict`
+    /// argument for `K`.
+    fn unpacked_typevar_kwargs(&self) -> Option<UnpackedTypeVarKwargsArgument<'db>> {
+        UnpackedTypeVarKwargsArgument::collect(
+            self.db,
+            self.env,
+            self.signature.parameters(),
+            self.arguments,
+            self.argument_matches,
         )
     }
 }
@@ -6350,6 +6512,9 @@ impl<'db> CallInference<'_, 'db> {
         specialization_errors: &mut Vec<BindingError<'db>>,
     ) -> TypeVarInference<'db> {
         let db = self.db;
+        let unpacked_typevar_kwargs = self.unpacked_typevar_kwargs();
+        let unpacked_typevar_kwargs_type = unpacked_typevar_kwargs
+            .map(|kwargs| self.signature.parameters()[kwargs.parameter_index].annotated_type());
 
         // Attempt to promote any promotable types assigned to the specialization.
         // The hook receives (typevar, bounds) and returns Some(solution) to override the default
@@ -6365,6 +6530,12 @@ impl<'db> CallInference<'_, 'db> {
                 bound_or_constraints,
                 Some(TypeVarBoundOrConstraints::Constraints(_))
             ) {
+                return None;
+            }
+
+            // The item types of the `TypedDict` inferred for `**kwargs: Unpack[K]` already follow
+            // the literal rules of PEP 827.
+            if unpacked_typevar_kwargs_type == Some(Type::TypeVar(typevar)) {
                 return None;
             }
 
@@ -6476,7 +6647,15 @@ impl<'db> CallInference<'_, 'db> {
 
                 builder.build_diagnostic_inference_with(
                     self.argument_relations()
-                        .map(|relation| (relation.declared_type, relation.argument_type)),
+                        .map(|relation| (relation.declared_type, relation.argument_type))
+                        .chain(
+                            unpacked_typevar_kwargs
+                                .into_iter()
+                                .zip(unpacked_typevar_kwargs_type)
+                                .map(|(kwargs, declared_type)| {
+                                    (declared_type, kwargs.argument_type)
+                                }),
+                        ),
                     choose,
                 )
             }
@@ -6801,6 +6980,27 @@ impl<'db> CallInference<'_, 'db> {
             }
         }
 
+        if let Some(kwargs) = self.unpacked_typevar_kwargs()
+            && !(self.is_partial_application && kwargs.argument_index.is_none())
+        {
+            let parameter = &self.signature.parameters()[kwargs.parameter_index];
+            let declared_type = parameter.annotated_type();
+            if let Err(error) = builder.infer(declared_type, kwargs.argument_type) {
+                if let Some(argument_index) = kwargs.argument_index {
+                    constraint_set_errors[argument_index] = true;
+                }
+                specialization_errors.push(BindingError::SpecializationError {
+                    error,
+                    argument_index: kwargs.adjusted_argument_index,
+                    argument: Some(SpecializationErrorContext {
+                        parameter_definition: parameter.definition(),
+                        expected_ty: declared_type,
+                        provided_ty: Some(kwargs.argument_type),
+                    }),
+                });
+            }
+        }
+
         self.infer_typevartuple_argument_constraints(
             builder,
             !preferred_type_mappings.is_empty(),
@@ -6834,6 +7034,11 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
         let parameters = self.signature.parameters();
         let parameter = &parameters[parameter_index];
         if Self::is_gradual_variadic_parameter(parameters, parameter_index) {
+            return;
+        }
+        // The arguments of a `**kwargs: Unpack[K]` parameter are checked together, see
+        // `check_unpacked_typevar_kwargs_argument_type`.
+        if parameter.is_unpacked_typevar_kwargs() {
             return;
         }
 
@@ -7147,6 +7352,73 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
                     }
                 }
             }
+        }
+
+        self.check_unpacked_typevar_kwargs_argument_type(constraints);
+    }
+
+    /// Checks the `TypedDict` collected from the keyword arguments of a `**kwargs: Unpack[K]`
+    /// parameter against the (specialized) parameter type.
+    fn check_unpacked_typevar_kwargs_argument_type(
+        &mut self,
+        constraints: &ConstraintSetBuilder<'db>,
+    ) {
+        let db = self.db;
+        let Some(kwargs) = UnpackedTypeVarKwargsArgument::collect(
+            db,
+            self.env,
+            self.signature.parameters(),
+            self.arguments,
+            self.argument_matches,
+        ) else {
+            return;
+        };
+        let parameter_index = kwargs.parameter_index;
+        let parameter = &self.signature.parameters()[parameter_index];
+        let declared_type = parameter.annotated_type();
+
+        let mut argument_type = kwargs.argument_type;
+        let mut expected_ty = declared_type;
+        if let Some(specialization) = self.merged_specialization() {
+            argument_type = argument_type.apply_specialization(db, specialization);
+            expected_ty = expected_ty.apply_specialization(db, specialization);
+        }
+        self.parameter_tys[parameter_index] = Some(argument_type);
+
+        // Inference has already reported a mismatch with the bound of `K`.
+        let reported_by_inference = kwargs
+            .argument_index
+            .is_some_and(|argument_index| self.constraint_set_errors[argument_index])
+            || self.errors.iter().any(|error| {
+                matches!(
+                    error,
+                    BindingError::SpecializationError { error, .. }
+                        if Type::TypeVar(error.bound_typevar()) == declared_type
+                )
+            });
+        if reported_by_inference {
+            return;
+        }
+
+        if argument_type
+            .when_assignable_to(
+                db,
+                self.env,
+                expected_ty,
+                constraints,
+                self.inferable_typevars,
+            )
+            .is_never_satisfied(db, self.env, self.inferable_typevars)
+        {
+            self.errors.push(BindingError::InvalidArgumentType {
+                parameter: ParameterContext::new(parameter, parameter_index, false),
+                argument_index: kwargs.adjusted_argument_index,
+                last_argument_index: None,
+                expected_ty,
+                provided_ty: argument_type,
+                provenance: InvalidArgumentTypeProvenance::Argument,
+                parameter_source: None,
+            });
         }
     }
 
@@ -7712,9 +7984,15 @@ impl<'db> Binding<'db> {
         argument_index_offset: usize,
     ) {
         match getter.try_call(db, env, &CallArguments::positional([instance])) {
-            Ok(bindings) => self.set_return_type(bindings.return_type(db, env)),
+            Ok(bindings) => self.set_return_type(crate::types::type_operator::strip_annotated(
+                db,
+                bindings.return_type(db, env),
+            )),
             Err(CallError(_, bindings)) => {
-                self.set_return_type(bindings.return_type(db, env));
+                self.set_return_type(crate::types::type_operator::strip_annotated(
+                    db,
+                    bindings.return_type(db, env),
+                ));
                 self.errors.push(BindingError::PropertyGetterCallError(
                     PropertyAccessorCallError {
                         bindings,
@@ -8041,6 +8319,11 @@ impl<'db> Binding<'db> {
         let mut parameter_type = matched_parameter
             .expected_type
             .unwrap_or(original_parameter_type);
+        // The arguments of a `**kwargs: Unpack[K]` parameter are collected into a `TypedDict`; the
+        // bound of `K` is not a type context for any one of them.
+        if parameter.is_unpacked_typevar_kwargs() {
+            return None;
+        }
         let paramspec_callable = |paramspec| {
             let Type::Callable(callable) = self
                 .merged_specialization(db)
